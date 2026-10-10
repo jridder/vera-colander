@@ -1,0 +1,620 @@
+//! Rule model (stored as TOML) and the compiler that turns it into Sieve (RFC 5228).
+
+use anyhow::{anyhow, bail, Context, Result};
+use serde::{Deserialize, Serialize};
+use std::collections::BTreeSet;
+
+fn yes() -> bool {
+    true
+}
+fn is_false(b: &bool) -> bool {
+    !*b
+}
+fn is_true(b: &bool) -> bool {
+    *b
+}
+
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+pub struct RuleSet {
+    #[serde(default, rename = "rule", skip_serializing_if = "Vec::is_empty")]
+    pub rules: Vec<Rule>,
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Rule {
+    pub name: String,
+    #[serde(default = "yes", skip_serializing_if = "is_true")]
+    pub enabled: bool,
+    #[serde(default, rename = "match", skip_serializing_if = "MatchKind::is_all")]
+    pub match_kind: MatchKind,
+    #[serde(default, rename = "if", skip_serializing_if = "Vec::is_empty")]
+    pub conditions: Vec<Condition>,
+    #[serde(rename = "then")]
+    pub actions: Vec<Action>,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub stop: bool,
+}
+
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum MatchKind {
+    #[default]
+    All,
+    Any,
+}
+impl MatchKind {
+    fn is_all(&self) -> bool {
+        *self == MatchKind::All
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+pub struct Condition {
+    pub field: String,
+    pub op: Op,
+    #[serde(default, skip_serializing_if = "Values::is_empty")]
+    pub value: Values,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub not: bool,
+    #[serde(default, skip_serializing_if = "is_false")]
+    pub case_sensitive: bool,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "lowercase")]
+pub enum Op {
+    Is,
+    Contains,
+    Matches,
+    Regex,
+    Exists,
+    Over,
+    Under,
+}
+
+impl Op {
+    fn parse(s: &str) -> Result<Op> {
+        Ok(match s.to_ascii_lowercase().as_str() {
+            "is" | "==" | "=" => Op::Is,
+            "contains" | "has" => Op::Contains,
+            "matches" | "like" => Op::Matches,
+            "regex" | "~" => Op::Regex,
+            "exists" => Op::Exists,
+            "over" | ">" => Op::Over,
+            "under" | "<" => Op::Under,
+            _ => bail!("unknown operator {s:?} (is, contains, matches, regex, exists, over, under)"),
+        })
+    }
+}
+
+#[derive(Debug, Clone, PartialEq, Serialize, Deserialize)]
+#[serde(untagged)]
+pub enum Values {
+    One(String),
+    Many(Vec<String>),
+}
+impl Default for Values {
+    fn default() -> Self {
+        Values::Many(Vec::new())
+    }
+}
+impl Values {
+    pub fn list(&self) -> Vec<&str> {
+        match self {
+            Values::One(s) => vec![s.as_str()],
+            Values::Many(v) => v.iter().map(String::as_str).collect(),
+        }
+    }
+    fn is_empty(&self) -> bool {
+        self.list().is_empty()
+    }
+    fn from_vec(mut v: Vec<String>) -> Self {
+        if v.len() == 1 {
+            Values::One(v.remove(0))
+        } else {
+            Values::Many(v)
+        }
+    }
+}
+
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(tag = "action", rename_all = "lowercase")]
+pub enum Action {
+    Fileinto {
+        folder: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        create: bool,
+        #[serde(default, skip_serializing_if = "is_false")]
+        copy: bool,
+    },
+    Redirect {
+        address: String,
+        #[serde(default, skip_serializing_if = "is_false")]
+        copy: bool,
+    },
+    Keep,
+    Discard,
+    Reject {
+        reason: String,
+    },
+    Flag {
+        flags: Values,
+    },
+    Vacation {
+        reason: String,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        subject: Option<String>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        days: Option<u32>,
+        #[serde(default, skip_serializing_if = "Option::is_none")]
+        from: Option<String>,
+        #[serde(default, skip_serializing_if = "Values::is_empty")]
+        addresses: Values,
+    },
+    Stop,
+}
+
+// ---------------------------------------------------------------------------
+// Loading / saving
+
+pub fn load(path: &std::path::Path) -> Result<RuleSet> {
+    let text = std::fs::read_to_string(path)
+        .with_context(|| format!("reading {}", path.display()))?;
+    toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
+}
+
+pub fn load_or_empty(path: &std::path::Path) -> Result<RuleSet> {
+    if path.exists() {
+        load(path)
+    } else {
+        Ok(RuleSet::default())
+    }
+}
+
+pub fn save(path: &std::path::Path, set: &RuleSet) -> Result<()> {
+    compile(set).context("refusing to save an invalid rule set")?;
+    let text = toml::to_string(set)?;
+    std::fs::write(path, text).with_context(|| format!("writing {}", path.display()))
+}
+
+// ---------------------------------------------------------------------------
+// Compiler
+
+pub const HEADER: &str =
+    "# Generated by sievectl. Edit the rules file and redeploy; manual edits will be overwritten.\n";
+
+pub fn compile(set: &RuleSet) -> Result<String> {
+    let mut req = BTreeSet::new();
+    let mut body = String::new();
+    for (i, r) in set.rules.iter().enumerate() {
+        let mut local_req = BTreeSet::new();
+        let block = compile_rule(r, &mut local_req)
+            .with_context(|| format!("rule #{} {:?}", i + 1, r.name))?;
+        body.push('\n');
+        if r.enabled {
+            req.extend(local_req);
+            body.push_str(&block);
+        } else {
+            body.push_str(&format!("# [disabled] {}\n", one_line(&r.name)));
+        }
+    }
+    let mut out = String::from(HEADER);
+    if !req.is_empty() {
+        let list: Vec<String> = req.iter().map(|r| quote(r)).collect();
+        out.push_str(&format!("require [{}];\n", list.join(", ")));
+    }
+    out.push_str(&body);
+    Ok(out)
+}
+
+pub fn compile_rule(r: &Rule, req: &mut BTreeSet<&'static str>) -> Result<String> {
+    if r.actions.is_empty() && !r.stop {
+        bail!("rule has no actions");
+    }
+    let mut actions = Vec::new();
+    for a in &r.actions {
+        actions.push(compile_action(a, req)?);
+    }
+    if r.stop && !matches!(r.actions.last(), Some(Action::Stop)) {
+        actions.push("stop;".into());
+    }
+    let mut out = format!("# rule: {}\n", one_line(&r.name));
+    if r.conditions.is_empty() {
+        for a in actions {
+            out.push_str(&a);
+            out.push('\n');
+        }
+        return Ok(out);
+    }
+    let tests: Vec<String> = r
+        .conditions
+        .iter()
+        .enumerate()
+        .map(|(i, c)| compile_condition(c, req).with_context(|| format!("condition #{}", i + 1)))
+        .collect::<Result<_>>()?;
+    let test = if tests.len() == 1 {
+        tests[0].clone()
+    } else {
+        let kw = if r.match_kind == MatchKind::Any { "anyof" } else { "allof" };
+        format!("{kw} (\n    {}\n)", tests.join(",\n    "))
+    };
+    out.push_str(&format!("if {test} {{\n"));
+    for a in actions {
+        out.push_str(&format!("    {a}\n"));
+    }
+    out.push_str("}\n");
+    Ok(out)
+}
+
+enum FieldKind {
+    Address(Vec<&'static str>),
+    Envelope(&'static str),
+    Header(String),
+    Body,
+    Size,
+}
+
+const ADDRESS_FIELDS: &[&str] = &[
+    "from", "to", "cc", "bcc", "sender", "reply-to", "resent-from", "resent-to",
+];
+
+fn classify(field: &str) -> Result<(FieldKind, Option<&'static str>)> {
+    let f = field.trim().to_ascii_lowercase();
+    let (base, part) = match f.rsplit_once('.') {
+        Some((b, "domain")) => (b.to_string(), Some(":domain")),
+        Some((b, "localpart")) | Some((b, "local")) => (b.to_string(), Some(":localpart")),
+        Some((b, "all")) => (b.to_string(), Some(":all")),
+        _ => (f.clone(), None),
+    };
+    let kind = match base.as_str() {
+        "to-or-cc" | "recipient" => FieldKind::Address(vec!["to", "cc"]),
+        "envelope-from" => FieldKind::Envelope("from"),
+        "envelope-to" => FieldKind::Envelope("to"),
+        "body" => FieldKind::Body,
+        "size" => FieldKind::Size,
+        b if ADDRESS_FIELDS.contains(&b) => {
+            FieldKind::Address(vec![ADDRESS_FIELDS.iter().find(|x| **x == b).unwrap()])
+        }
+        b => {
+            let h = b.strip_prefix("header:").unwrap_or(b);
+            if h.is_empty() || !h.bytes().all(|c| c.is_ascii_graphic() && c != b':') {
+                bail!("invalid field/header name {field:?}");
+            }
+            FieldKind::Header(h.to_string())
+        }
+    };
+    if part.is_some() && !matches!(kind, FieldKind::Address(_) | FieldKind::Envelope(_)) {
+        bail!("{field:?}: .domain/.localpart only apply to address fields");
+    }
+    Ok((kind, part))
+}
+
+fn compile_condition(c: &Condition, req: &mut BTreeSet<&'static str>) -> Result<String> {
+    let (kind, part) = classify(&c.field)?;
+    let vals = c.value.list();
+    let cmp = if c.case_sensitive { " :comparator \"i;octet\"" } else { "" };
+    let test = match c.op {
+        Op::Exists => {
+            let names: Vec<String> = match kind {
+                FieldKind::Address(h) => h.into_iter().map(String::from).collect(),
+                FieldKind::Header(h) => vec![h],
+                _ => bail!("'exists' only works on header fields"),
+            };
+            format!("exists {}", strlist(&names.iter().map(String::as_str).collect::<Vec<_>>()))
+        }
+        Op::Over | Op::Under => {
+            if !matches!(kind, FieldKind::Size) {
+                bail!("over/under only apply to field \"size\"");
+            }
+            let [v] = vals.as_slice() else { bail!("size needs exactly one value, e.g. \"5M\"") };
+            let v = v.trim().to_ascii_uppercase();
+            let digits = v.trim_end_matches(['K', 'M', 'G']);
+            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || v.len() - digits.len() > 1 {
+                bail!("invalid size {v:?} (use e.g. 500K, 5M, 1G)");
+            }
+            format!("size :{} {v}", if c.op == Op::Over { "over" } else { "under" })
+        }
+        Op::Is | Op::Contains | Op::Matches | Op::Regex => {
+            if matches!(kind, FieldKind::Size) {
+                bail!("field \"size\" needs op over or under");
+            }
+            if vals.is_empty() {
+                bail!("missing value");
+            }
+            let mt = match c.op {
+                Op::Is => ":is",
+                Op::Contains => ":contains",
+                Op::Matches => ":matches",
+                _ => {
+                    req.insert("regex");
+                    ":regex"
+                }
+            };
+            let part = part.map(|p| format!(" {p}")).unwrap_or_default();
+            let v = strlist(&vals);
+            match kind {
+                FieldKind::Address(h) => format!("address{part} {mt}{cmp} {} {v}", strlist(&h)),
+                FieldKind::Envelope(e) => {
+                    req.insert("envelope");
+                    format!("envelope{part} {mt}{cmp} {} {v}", quote(e))
+                }
+                FieldKind::Header(h) => format!("header {mt}{cmp} {} {v}", quote(&h)),
+                FieldKind::Body => {
+                    req.insert("body");
+                    format!("body :text {mt}{cmp} {v}")
+                }
+                FieldKind::Size => unreachable!(),
+            }
+        }
+    };
+    Ok(if c.not { format!("not {test}") } else { test })
+}
+
+fn compile_action(a: &Action, req: &mut BTreeSet<&'static str>) -> Result<String> {
+    Ok(match a {
+        Action::Fileinto { folder, create, copy } => {
+            if folder.trim().is_empty() {
+                bail!("fileinto needs a folder");
+            }
+            req.insert("fileinto");
+            let mut s = String::from("fileinto");
+            if *create {
+                req.insert("mailbox");
+                s.push_str(" :create");
+            }
+            if *copy {
+                req.insert("copy");
+                s.push_str(" :copy");
+            }
+            format!("{s} {};", quote(folder))
+        }
+        Action::Redirect { address, copy } => {
+            if !address.contains('@') {
+                bail!("redirect needs an email address, got {address:?}");
+            }
+            if *copy {
+                req.insert("copy");
+                format!("redirect :copy {};", quote(address))
+            } else {
+                format!("redirect {};", quote(address))
+            }
+        }
+        Action::Keep => "keep;".into(),
+        Action::Discard => "discard;".into(),
+        Action::Stop => "stop;".into(),
+        Action::Reject { reason } => {
+            req.insert("reject");
+            format!("reject {};", quote(reason))
+        }
+        Action::Flag { flags } => {
+            if flags.is_empty() {
+                bail!("flag needs at least one flag");
+            }
+            req.insert("imap4flags");
+            format!("addflag {};", strlist(&flags.list()))
+        }
+        Action::Vacation { reason, subject, days, from, addresses } => {
+            req.insert("vacation");
+            let mut s = String::from("vacation");
+            if let Some(d) = days {
+                s.push_str(&format!(" :days {d}"));
+            }
+            if let Some(sub) = subject {
+                s.push_str(&format!(" :subject {}", quote(sub)));
+            }
+            if let Some(f) = from {
+                s.push_str(&format!(" :from {}", quote(f)));
+            }
+            if !addresses.is_empty() {
+                s.push_str(&format!(" :addresses {}", strlist(&addresses.list())));
+            }
+            format!("{s} {};", quote(reason))
+        }
+    })
+}
+
+/// Extensions named in the script's `require` line.
+pub fn required(script: &str) -> Vec<String> {
+    script
+        .lines()
+        .find(|l| l.starts_with("require"))
+        .map(|l| l.split('"').skip(1).step_by(2).map(String::from).collect())
+        .unwrap_or_default()
+}
+
+pub fn quote(s: &str) -> String {
+    format!("\"{}\"", s.replace('\\', "\\\\").replace('"', "\\\""))
+}
+
+fn strlist(v: &[&str]) -> String {
+    if v.len() == 1 {
+        quote(v[0])
+    } else {
+        format!("[{}]", v.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", "))
+    }
+}
+
+fn one_line(s: &str) -> String {
+    s.replace(['\r', '\n'], " ")
+}
+
+// ---------------------------------------------------------------------------
+// One-line syntax used by `sievectl rule add --if ... --then ...`
+
+fn take_word(s: &str) -> (&str, &str) {
+    let s = s.trim_start();
+    match s.find(char::is_whitespace) {
+        Some(i) => (&s[..i], s[i..].trim_start()),
+        None => (s, ""),
+    }
+}
+
+fn unquote(s: &str) -> String {
+    let t = s.trim();
+    if t.len() >= 2 && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\''))) {
+        t[1..t.len() - 1].to_string()
+    } else {
+        t.to_string()
+    }
+}
+
+/// `FIELD [not] OP [VALUE[|VALUE...]]`, e.g. `from.domain is github.com`,
+/// `subject contains invoice|receipt`, `list-id exists`, `size over 10M`.
+pub fn parse_condition(s: &str) -> Result<Condition> {
+    let (field, rest) = take_word(s);
+    if field.is_empty() {
+        bail!("empty condition");
+    }
+    let (mut op, mut rest) = take_word(rest);
+    let mut not = false;
+    if op.eq_ignore_ascii_case("not") || op == "!" {
+        not = true;
+        (op, rest) = take_word(rest);
+    }
+    let op = Op::parse(op).with_context(|| format!("in condition {s:?}"))?;
+    let vals: Vec<String> = if rest.is_empty() {
+        vec![]
+    } else {
+        rest.split('|').map(unquote).filter(|v| !v.is_empty()).collect()
+    };
+    let c = Condition {
+        field: field.to_string(),
+        op,
+        value: Values::from_vec(vals),
+        not,
+        case_sensitive: false,
+    };
+    compile_condition(&c, &mut BTreeSet::new()).with_context(|| format!("in condition {s:?}"))?;
+    Ok(c)
+}
+
+/// `fileinto FOLDER`, `copy FOLDER`, `redirect ADDR`, `forward ADDR`, `keep`,
+/// `discard`, `reject REASON`, `flag FLAG...`, `read`, `vacation TEXT`, `stop`.
+pub fn parse_action(s: &str, create: bool) -> Result<Action> {
+    let (verb, rest) = take_word(s);
+    let arg = unquote(rest);
+    let need = |what: &str| -> Result<String> {
+        if arg.is_empty() {
+            Err(anyhow!("{verb} needs {what}"))
+        } else {
+            Ok(arg.clone())
+        }
+    };
+    Ok(match verb.to_ascii_lowercase().as_str() {
+        "fileinto" | "move" | "folder" => Action::Fileinto { folder: need("a folder")?, create, copy: false },
+        "copy" | "copyto" => Action::Fileinto { folder: need("a folder")?, create, copy: true },
+        "redirect" => Action::Redirect { address: need("an address")?, copy: false },
+        "forward" => Action::Redirect { address: need("an address")?, copy: true },
+        "keep" => Action::Keep,
+        "discard" | "delete" => Action::Discard,
+        "stop" => Action::Stop,
+        "reject" => Action::Reject { reason: need("a reason")? },
+        "flag" => Action::Flag {
+            flags: Values::from_vec(rest.split_whitespace().map(unquote).collect()),
+        },
+        "read" | "seen" => Action::Flag { flags: Values::One("\\Seen".into()) },
+        "vacation" => Action::Vacation {
+            reason: need("a message")?,
+            subject: None,
+            days: None,
+            from: None,
+            addresses: Values::default(),
+        },
+        _ => bail!("unknown action {verb:?} (fileinto, copy, redirect, forward, keep, discard, reject, flag, read, vacation, stop)"),
+    })
+}
+
+pub const EXAMPLE: &str = r#"# sievectl rules file
+#   sievectl compile rules.toml            -> print the generated Sieve script
+#   sievectl deploy rules.toml --activate  -> validate, upload and activate
+#
+# field:   from, to, cc, bcc, sender, reply-to, to-or-cc, subject, body, size,
+#          envelope-from, envelope-to, or any header name (e.g. "list-id").
+#          Address fields accept .domain / .localpart (e.g. "from.domain").
+# op:      is, contains, matches (* and ? wildcards), regex, exists, over, under
+# value:   a string or a list of strings (any of them matches)
+# options: not = true, case_sensitive = true
+# match:   "all" (default) or "any" of the conditions
+# actions: fileinto (folder, create, copy), redirect (address, copy), keep,
+#          discard, reject (reason), flag (flags), vacation (reason, subject,
+#          days, from, addresses), stop
+# Rules run top to bottom; stop = true ends processing after a match.
+
+[[rule]]
+name = "Mailing lists"
+if = [{ field = "list-id", op = "contains", value = "lists.debian.org" }]
+then = [{ action = "fileinto", folder = "Lists/Debian", create = true }]
+stop = true
+
+[[rule]]
+name = "GitHub"
+match = "any"
+if = [
+  { field = "from", op = "is", value = "notifications@github.com" },
+  { field = "from.domain", op = "is", value = ["github.com", "githubusercontent.com"] },
+]
+then = [{ action = "fileinto", folder = "GitHub" }]
+stop = true
+
+[[rule]]
+name = "Receipts"
+if = [{ field = "subject", op = "contains", value = ["receipt", "invoice", "order confirmation"] }]
+then = [
+  { action = "fileinto", folder = "Receipts" },
+  { action = "flag", flags = "\\Seen" },
+]
+stop = true
+
+[[rule]]
+name = "Large mail"
+if = [{ field = "size", op = "over", value = "20M" }]
+then = [{ action = "flag", flags = "\\Flagged" }]
+
+[[rule]]
+name = "Out of office"
+enabled = false
+then = [{ action = "vacation", days = 7, subject = "Away", reason = "I'm away until Monday and will reply when I'm back." }]
+"#;
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn example_compiles() {
+        let set: RuleSet = toml::from_str(EXAMPLE).unwrap();
+        let s = compile(&set).unwrap();
+        assert!(s.contains(r#"require ["fileinto", "imap4flags", "mailbox"];"#), "{s}");
+        assert!(s.contains(r#"address :domain :is "from" ["github.com", "githubusercontent.com"]"#));
+        assert!(s.contains(r#"addflag "\\Seen";"#));
+        assert!(s.contains("size :over 20M"));
+        assert!(s.contains("# [disabled] Out of office"));
+        assert!(!s.contains("vacation"), "disabled rule must not add requires");
+        println!("{s}");
+    }
+
+    #[test]
+    fn one_liners() {
+        let c = parse_condition("subject not contains \"hello world\"|bye").unwrap();
+        assert!(c.not);
+        assert_eq!(c.value, Values::Many(vec!["hello world".into(), "bye".into()]));
+        assert!(parse_condition("size contains 5").is_err());
+        assert!(parse_condition("subject.domain is x").is_err());
+        assert!(parse_condition("list-id exists").is_ok());
+        assert!(matches!(parse_action("forward a@b.c", false).unwrap(), Action::Redirect { copy: true, .. }));
+        assert!(parse_action("redirect nobody", false).is_ok()); // validated at compile
+    }
+
+    #[test]
+    fn roundtrip_toml() {
+        let set: RuleSet = toml::from_str(EXAMPLE).unwrap();
+        let text = toml::to_string(&set).unwrap();
+        let back: RuleSet = toml::from_str(&text).unwrap();
+        assert_eq!(compile(&set).unwrap(), compile(&back).unwrap());
+    }
+
+    #[test]
+    fn escaping() {
+        assert_eq!(quote(r#"a "b" \c"#), r#""a \"b\" \\c""#);
+    }
+}

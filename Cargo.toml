@@ -1,0 +1,24 @@
+[package]
+name = "sievectl"
+version = "0.1.0"
+edition = "2021"
+description = "Cross-platform ManageSieve client and Sieve rule builder"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+base64 = "0.22"
+clap = { version = "4", features = ["derive", "env"] }
+directories = "6"
+rpassword = "7"
+rustls = { version = "0.23", default-features = false, features = ["ring", "std", "tls12", "logging"] }
+rustls-pki-types = { version = "1", features = ["std"] }
+serde = { version = "1", features = ["derive"] }
+tempfile = "3"
+toml = "0.8"
+webpki-roots = "1"
+
+[profile.release]
+lto = true
+strip = true
+codegen-units = 1
