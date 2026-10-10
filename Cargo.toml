@@ -5,7 +5,19 @@ edition = "2021"
 description = "Cross-platform ManageSieve client and Sieve rule builder"
 license = "MIT"
 
+[features]
+default = ["gui"]
+gui = ["dep:eframe", "dep:egui"]
+
+[[bin]]
+name = "sievectl-gui"
+path = "src/bin/sievectl-gui/main.rs"
+required-features = ["gui"]
+
 [dependencies]
+eframe = { version = "0.36", optional = true, default-features = false, features = ["default_fonts", "glow", "persistence", "wayland", "x11", "accesskit"] }
+egui = { version = "0.36", optional = true }
+keyring = { version = "3", features = ["apple-native", "windows-native", "async-secret-service", "async-io", "crypto-rust"] }
 anyhow = "1"
 base64 = "0.22"
 clap = { version = "4", features = ["derive", "env"] }

@@ -95,7 +95,11 @@ impl Capabilities {
     }
     pub fn sasl(&self) -> Vec<String> {
         self.get("SASL")
-            .map(|s| s.split_whitespace().map(|m| m.to_ascii_uppercase()).collect())
+            .map(|s| {
+                s.split_whitespace()
+                    .map(|m| m.to_ascii_uppercase())
+                    .collect()
+            })
             .unwrap_or_default()
     }
     pub fn sieve_extensions(&self) -> Vec<String> {
@@ -105,6 +109,7 @@ impl Capabilities {
     }
 }
 
+#[derive(Clone)]
 pub struct ConnectOptions {
     pub host: String,
     pub port: u16,
@@ -148,7 +153,8 @@ impl Client {
                 "could not connect to {}:{}: {}",
                 o.host,
                 o.port,
-                last.map(|e| e.to_string()).unwrap_or_else(|| "no addresses".into())
+                last.map(|e| e.to_string())
+                    .unwrap_or_else(|| "no addresses".into())
             )
         })?;
         tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
@@ -176,10 +182,17 @@ impl Client {
             c.send(&[Arg::Atom("STARTTLS")])?;
             c.read_response()?.ok().context("STARTTLS")?;
             let inner = c.r.take().unwrap().into_inner();
-            c.r = Some(BufReader::new(tls_wrap(inner, &o.host, o.ca_file.as_deref())?));
+            c.r = Some(BufReader::new(tls_wrap(
+                inner,
+                &o.host,
+                o.ca_file.as_deref(),
+            )?));
             c.tls_active = true;
             // RFC 5804 2.2: server re-issues capabilities after TLS negotiation.
-            let caps = c.read_response()?.ok().context("post-STARTTLS capabilities")?;
+            let caps = c
+                .read_response()?
+                .ok()
+                .context("post-STARTTLS capabilities")?;
             c.caps = Capabilities::from_lines(&caps.lines);
         }
         Ok(c)
@@ -188,7 +201,10 @@ impl Client {
     pub fn authenticate_plain(&mut self, user: &str, pass: &str) -> Result<()> {
         let mechs = self.caps.sasl();
         if !mechs.iter().any(|m| m == "PLAIN") {
-            bail!("server does not offer SASL PLAIN (offers: {})", mechs.join(" "));
+            bail!(
+                "server does not offer SASL PLAIN (offers: {})",
+                mechs.join(" ")
+            );
         }
         let ir = base64::engine::general_purpose::STANDARD.encode(format!("\0{user}\0{pass}"));
         self.send(&[Arg::Atom("AUTHENTICATE"), Arg::Str("PLAIN"), Arg::Str(&ir)])?;
@@ -239,7 +255,11 @@ impl Client {
     }
 
     pub fn put_script(&mut self, name: &str, content: &str) -> Result<Option<String>> {
-        self.send(&[Arg::Atom("PUTSCRIPT"), Arg::Str(name), Arg::Lit(content.as_bytes())])?;
+        self.send(&[
+            Arg::Atom("PUTSCRIPT"),
+            Arg::Str(name),
+            Arg::Lit(content.as_bytes()),
+        ])?;
         let r = self.read_response()?;
         match r.status {
             Status::Ok => Ok(warnings(&r)),
@@ -315,7 +335,9 @@ impl Client {
 
     fn peek(&mut self) -> Result<u8> {
         let buf = self.rd().fill_buf()?;
-        buf.first().copied().ok_or_else(|| anyhow!("server closed the connection"))
+        buf.first()
+            .copied()
+            .ok_or_else(|| anyhow!("server closed the connection"))
     }
 
     fn bump(&mut self) -> Result<u8> {
@@ -470,7 +492,12 @@ impl Client {
                 Token::Str(s) => Some(s.clone()),
                 _ => None,
             });
-            return Ok(Response { lines, status, code, message });
+            return Ok(Response {
+                lines,
+                status,
+                code,
+                message,
+            });
         }
     }
 }
@@ -489,7 +516,11 @@ fn push_literal(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-fn tls_wrap(stream: Box<dyn Stream>, host: &str, ca_file: Option<&Path>) -> Result<Box<dyn Stream>> {
+fn tls_wrap(
+    stream: Box<dyn Stream>,
+    host: &str,
+    ca_file: Option<&Path>,
+) -> Result<Box<dyn Stream>> {
     let mut roots = rustls::RootCertStore::empty();
     roots.extend(webpki_roots::TLS_SERVER_ROOTS.iter().cloned());
     if let Some(p) = ca_file {
@@ -508,9 +539,9 @@ fn tls_wrap(stream: Box<dyn Stream>, host: &str, ca_file: Option<&Path>) -> Resu
     let conn = rustls::ClientConnection::new(Arc::new(cfg), name)?;
     let mut tls = rustls::StreamOwned::new(conn, stream);
     while tls.conn.is_handshaking() {
-        tls.conn
-            .complete_io(&mut tls.sock)
-            .with_context(|| format!("TLS handshake with {host} failed (private CA? use --ca-file)"))?;
+        tls.conn.complete_io(&mut tls.sock).with_context(|| {
+            format!("TLS handshake with {host} failed (private CA? use --ca-file)")
+        })?;
     }
     Ok(Box::new(tls))
 }
@@ -551,7 +582,10 @@ mod tests {
     fn full_session() {
         let port = fake_server(vec![
             ("AUTHENTICATE \"PLAIN\"", "OK\r\n"),
-            ("LISTSCRIPTS", "\"main\" ACTIVE\r\n\"old \\\"one\\\"\"\r\nOK\r\n"),
+            (
+                "LISTSCRIPTS",
+                "\"main\" ACTIVE\r\n\"old \\\"one\\\"\"\r\nOK\r\n",
+            ),
             ("GETSCRIPT \"main\"", "{12}\r\nkeep;\r\nstop;\r\nOK\r\n"),
             ("CHECKSCRIPT {", "NO \"line 1: unknown command 'foo'\"\r\n"),
             ("PUTSCRIPT \"x\" {", "OK (WARNINGS) \"line 2: unused\"\r\n"),
@@ -575,7 +609,10 @@ mod tests {
         assert_eq!(c.get_script("main").unwrap(), "keep;\r\nstop;");
         let e = c.check_script("foo;").unwrap_err().to_string();
         assert!(e.contains("unknown command"));
-        assert_eq!(c.put_script("x", "keep;").unwrap().as_deref(), Some("line 2: unused"));
+        assert_eq!(
+            c.put_script("x", "keep;").unwrap().as_deref(),
+            Some("line 2: unused")
+        );
         let e = c.set_active("x").unwrap_err().to_string();
         assert!(e.contains("NONEXISTENT"), "{e}");
     }

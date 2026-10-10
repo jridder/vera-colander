@@ -1,6 +1,4 @@
-mod config;
-mod managesieve;
-mod rules;
+use sievectl::{config, managesieve, rules};
 
 use anyhow::{bail, Context, Result};
 use clap::{Args, Parser, Subcommand};
@@ -10,7 +8,11 @@ use std::path::{Path, PathBuf};
 use std::process::Command;
 
 #[derive(Parser)]
-#[command(name = "sievectl", version, about = "ManageSieve client and Sieve rule builder")]
+#[command(
+    name = "sievectl",
+    version,
+    about = "ManageSieve client and Sieve rule builder"
+)]
 struct Cli {
     #[command(flatten)]
     conn: ConnArgs,
@@ -21,7 +23,13 @@ struct Cli {
 #[derive(Args)]
 struct ConnArgs {
     /// Config profile
-    #[arg(short = 'P', long, global = true, env = "SIEVECTL_PROFILE", default_value = "default")]
+    #[arg(
+        short = 'P',
+        long,
+        global = true,
+        env = "SIEVECTL_PROFILE",
+        default_value = "default"
+    )]
     profile: String,
     /// ManageSieve server
     #[arg(short = 'H', long, global = true, env = "SIEVECTL_HOST")]
@@ -114,9 +122,23 @@ enum Cmd {
         #[arg(long)]
         force: bool,
     },
+    /// Download a script made by sievectl and write its rules back to a TOML file
+    Pull {
+        name: String,
+        #[arg(default_value = "rules.toml")]
+        file: PathBuf,
+        #[arg(short, long)]
+        force: bool,
+    },
     /// Manage rules in a rules file
     #[command(subcommand)]
     Rule(RuleCmd),
+    /// Store the password in the system keychain (shared with the GUI)
+    Login {
+        /// Remove the stored password instead
+        #[arg(long)]
+        forget: bool,
+    },
     /// Show the config file location, or create it with --init
     Config {
         #[arg(long)]
@@ -212,12 +234,24 @@ impl Ctx {
     }
 
     fn connect(&self) -> Result<Client> {
+        self.connect_opt(None)
+    }
+
+    fn connect_with(&self, pw: &str) -> Result<Client> {
+        self.connect_opt(Some(pw))
+    }
+
+    fn connect_opt(&self, pw: Option<&str>) -> Result<Client> {
         let a = &self.args;
         let p = &self.profile;
         let host = a.host.clone().or_else(|| p.host.clone()).context(
             "no server given: use --host or set host in the config file (see `sievectl config --init`)",
         )?;
-        let user = a.user.clone().or_else(|| p.user.clone()).context("no user given: use --user or config")?;
+        let user = a
+            .user
+            .clone()
+            .or_else(|| p.user.clone())
+            .context("no user given: use --user or config")?;
         let tls = a.tls.or(p.tls).unwrap_or(TlsMode::Starttls);
         let opts = ConnectOptions {
             host: host.clone(),
@@ -230,7 +264,10 @@ impl Ctx {
         if !c.tls_active && !(a.allow_plaintext || p.allow_plaintext.unwrap_or(false)) {
             bail!("refusing to send password without TLS (pass --allow-plaintext to override)");
         }
-        let pass = config::password(p, &user, &host)?;
+        let pass = match pw {
+            Some(pw) => pw.to_string(),
+            None => config::password(p, &user, &host)?,
+        };
         c.authenticate_plain(&user, &pass)?;
         Ok(c)
     }
@@ -262,7 +299,10 @@ fn print_warnings(w: Option<String>) {
 fn run() -> Result<()> {
     let cli = Cli::parse();
     let profile = config::load_profile(&cli.conn.profile)?;
-    let ctx = Ctx { args: cli.conn, profile };
+    let ctx = Ctx {
+        args: cli.conn,
+        profile,
+    };
 
     match cli.cmd {
         Cmd::Caps => {
@@ -291,10 +331,17 @@ fn run() -> Result<()> {
                 None => print!("{s}"),
             }
         }
-        Cmd::Put { name, file, activate } => {
+        Cmd::Put {
+            name,
+            file,
+            activate,
+        } => {
             let script = read_input(&file)?;
             let mut c = ctx.connect()?;
-            print_warnings(c.check_script(&script).context("script rejected by server")?);
+            print_warnings(
+                c.check_script(&script)
+                    .context("script rejected by server")?,
+            );
             c.put_script(&name, &script)?;
             eprintln!("uploaded {name} ({} bytes)", script.len());
             if activate {
@@ -353,7 +400,13 @@ fn run() -> Result<()> {
                 None => print!("{script}"),
             }
         }
-        Cmd::Deploy { rules: r, name, activate, dry_run, force } => {
+        Cmd::Deploy {
+            rules: r,
+            name,
+            activate,
+            dry_run,
+            force,
+        } => {
             let path = ctx.rules_path(r);
             let script = rules::compile(&rules::load(&path)?)?;
             let name = name
@@ -370,7 +423,10 @@ fn run() -> Result<()> {
                     eprintln!("warning: server does not advertise: {}", missing.join(", "));
                 }
             }
-            print_warnings(c.check_script(&script).context("server rejected the generated script")?);
+            print_warnings(
+                c.check_script(&script)
+                    .context("server rejected the generated script")?,
+            );
             if dry_run {
                 print!("{script}");
                 eprintln!("dry run: script is valid, nothing uploaded");
@@ -380,14 +436,19 @@ fn run() -> Result<()> {
             let existing = c.list_scripts()?;
             let current = existing.iter().find(|(n, _)| *n == name);
             let same = match current {
-                Some(_) if !force => c.get_script(&name)?.replace("\r\n", "\n") == script.replace("\r\n", "\n"),
+                Some(_) if !force => {
+                    c.get_script(&name)?.replace("\r\n", "\n") == script.replace("\r\n", "\n")
+                }
                 _ => false,
             };
             if same {
                 eprintln!("{name} is unchanged on the server");
             } else {
                 print_warnings(c.put_script(&name, &script)?);
-                eprintln!("uploaded {name} ({} rules)", rules::load(&path)?.rules.len());
+                eprintln!(
+                    "uploaded {name} ({} rules)",
+                    rules::load(&path)?.rules.len()
+                );
             }
             if activate && !current.is_some_and(|(_, a)| *a) {
                 c.set_active(&name)?;
@@ -397,7 +458,45 @@ fn run() -> Result<()> {
             }
             c.logout();
         }
+        Cmd::Pull { name, file, force } => {
+            if file.exists() && !force {
+                bail!("{} exists (use --force to overwrite)", file.display());
+            }
+            let mut c = ctx.connect()?;
+            let script = c.get_script(&name)?;
+            c.logout();
+            let set = rules::extract(&script).with_context(|| {
+                format!("{name} was not generated by sievectl (no embedded rules)")
+            })??;
+            rules::save(&file, &set)?;
+            eprintln!("wrote {} rules to {}", set.rules.len(), file.display());
+        }
         Cmd::Rule(rc) => rule_cmd(&ctx, rc)?,
+        Cmd::Login { forget } => {
+            let host = ctx
+                .args
+                .host
+                .clone()
+                .or_else(|| ctx.profile.host.clone())
+                .context("no server given")?;
+            let user = ctx
+                .args
+                .user
+                .clone()
+                .or_else(|| ctx.profile.user.clone())
+                .context("no user given")?;
+            let entry = config::keychain_entry(&user, &host)?;
+            if forget {
+                entry.delete_credential()?;
+                eprintln!("removed stored password for {user}@{host}");
+            } else {
+                let p = rpassword::prompt_password(format!("Password for {user}@{host}: "))?;
+                let c = ctx.connect_with(&p)?;
+                c.logout();
+                entry.set_password(&p)?;
+                eprintln!("password verified and stored in the system keychain");
+            }
+        }
         Cmd::Config { init } => {
             let p = config::path().context("could not determine config directory")?;
             if init {
@@ -429,7 +528,16 @@ fn find(set: &rules::RuleSet, name: &str) -> Result<usize> {
 
 fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
     match rc {
-        RuleCmd::Add { file, name, conds, actions, any, stop, create, at } => {
+        RuleCmd::Add {
+            file,
+            name,
+            conds,
+            actions,
+            any,
+            stop,
+            create,
+            at,
+        } => {
             let path = ctx.rules_path(file);
             let mut set = rules::load_or_empty(&path)?;
             if find(&set, &name).is_ok() {
@@ -438,8 +546,15 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
             let mut rule = rules::Rule {
                 name,
                 enabled: true,
-                match_kind: if any { rules::MatchKind::Any } else { rules::MatchKind::All },
-                conditions: conds.iter().map(|c| rules::parse_condition(c)).collect::<Result<_>>()?,
+                match_kind: if any {
+                    rules::MatchKind::Any
+                } else {
+                    rules::MatchKind::All
+                },
+                conditions: conds
+                    .iter()
+                    .map(|c| rules::parse_condition(c))
+                    .collect::<Result<_>>()?,
                 actions: Vec::new(),
                 stop,
             };
@@ -450,7 +565,9 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
                 }
             }
             let snippet = rules::compile_rule(&rule, &mut Default::default())?;
-            let pos = at.map(|n| n.clamp(1, set.rules.len() + 1) - 1).unwrap_or(set.rules.len());
+            let pos = at
+                .map(|n| n.clamp(1, set.rules.len() + 1) - 1)
+                .unwrap_or(set.rules.len());
             set.rules.insert(pos, rule);
             rules::save(&path, &set)?;
             eprintln!("added as rule #{} in {}:", pos + 1, path.display());
@@ -509,7 +626,13 @@ fn set_enabled(ctx: &Ctx, file: Option<PathBuf>, name: &str, on: bool) -> Result
 fn editor_command() -> Vec<String> {
     let e = std::env::var("VISUAL")
         .or_else(|_| std::env::var("EDITOR"))
-        .unwrap_or_else(|_| if cfg!(windows) { "notepad".into() } else { "vi".into() });
+        .unwrap_or_else(|_| {
+            if cfg!(windows) {
+                "notepad".into()
+            } else {
+                "vi".into()
+            }
+        });
     e.split_whitespace().map(String::from).collect()
 }
 
@@ -522,7 +645,10 @@ fn edit(ctx: &Ctx, name: &str, activate: bool) -> Result<()> {
         eprintln!("{name} does not exist yet; starting a new script");
         "require [\"fileinto\"];\n\n".to_string()
     };
-    let tmp = tempfile::Builder::new().prefix("sievectl-").suffix(".sieve").tempfile()?;
+    let tmp = tempfile::Builder::new()
+        .prefix("sievectl-")
+        .suffix(".sieve")
+        .tempfile()?;
     std::fs::write(tmp.path(), &original)?;
     let ed = editor_command();
     loop {
@@ -550,7 +676,10 @@ fn edit(ctx: &Ctx, name: &str, activate: bool) -> Result<()> {
                 eprintln!("server rejected the script:\n{e}");
                 if !confirm("Edit again?") {
                     let (_, kept) = tmp.keep()?;
-                    bail!("aborted, server copy unchanged; your edit is saved at {}", kept.display());
+                    bail!(
+                        "aborted, server copy unchanged; your edit is saved at {}",
+                        kept.display()
+                    );
                 }
             }
         }

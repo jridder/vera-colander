@@ -40,15 +40,21 @@ pub fn path() -> Option<PathBuf> {
 }
 
 pub fn load_profile(name: &str) -> Result<Profile> {
-    let Some(p) = path() else { return Ok(Profile::default()) };
+    let Some(p) = path() else {
+        return Ok(Profile::default());
+    };
     if !p.exists() {
         if name != "default" {
-            bail!("profile {name:?} requested but {} does not exist", p.display());
+            bail!(
+                "profile {name:?} requested but {} does not exist",
+                p.display()
+            );
         }
         return Ok(Profile::default());
     }
     let text = std::fs::read_to_string(&p).with_context(|| format!("reading {}", p.display()))?;
-    let mut cfg: ConfigFile = toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
+    let mut cfg: ConfigFile =
+        toml::from_str(&text).with_context(|| format!("parsing {}", p.display()))?;
     match cfg.profile.remove(name) {
         Some(pr) => Ok(pr),
         None if name == "default" => Ok(Profile::default()),
@@ -68,12 +74,27 @@ pub fn password(profile: &Profile, user: &str, host: &str) -> Result<String> {
         }
         .with_context(|| format!("running password_command {cmd:?}"))?;
         if !out.status.success() {
-            bail!("password_command failed: {}", String::from_utf8_lossy(&out.stderr).trim());
+            bail!(
+                "password_command failed: {}",
+                String::from_utf8_lossy(&out.stderr).trim()
+            );
         }
         let s = String::from_utf8(out.stdout).context("password_command output is not UTF-8")?;
         return Ok(s.lines().next().unwrap_or("").to_string());
     }
+    if let Ok(p) = keychain_entry(user, host).and_then(|e| Ok(e.get_password()?)) {
+        return Ok(p);
+    }
     rpassword::prompt_password(format!("Password for {user}@{host}: ")).context("reading password")
+}
+
+/// System keychain entry (macOS Keychain, Windows Credential Manager,
+/// Secret Service on Linux). Shared by the CLI and the GUI.
+pub fn keychain_entry(user: &str, host: &str) -> Result<keyring::Entry> {
+    Ok(keyring::Entry::new(
+        "sievectl",
+        &format!("{}@{}", user.trim(), host.trim()),
+    )?)
 }
 
 pub const TEMPLATE: &str = r#"# sievectl configuration. Select a profile with -P NAME (default: "default").

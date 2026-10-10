@@ -82,7 +82,9 @@ impl Op {
             "exists" => Op::Exists,
             "over" | ">" => Op::Over,
             "under" | "<" => Op::Under,
-            _ => bail!("unknown operator {s:?} (is, contains, matches, regex, exists, over, under)"),
+            _ => {
+                bail!("unknown operator {s:?} (is, contains, matches, regex, exists, over, under)")
+            }
         })
     }
 }
@@ -158,8 +160,8 @@ pub enum Action {
 // Loading / saving
 
 pub fn load(path: &std::path::Path) -> Result<RuleSet> {
-    let text = std::fs::read_to_string(path)
-        .with_context(|| format!("reading {}", path.display()))?;
+    let text =
+        std::fs::read_to_string(path).with_context(|| format!("reading {}", path.display()))?;
     toml::from_str(&text).with_context(|| format!("parsing {}", path.display()))
 }
 
@@ -204,7 +206,62 @@ pub fn compile(set: &RuleSet) -> Result<String> {
         out.push_str(&format!("require [{}];\n", list.join(", ")));
     }
     out.push_str(&body);
+    out.push_str(&embed(set)?);
     Ok(out)
+}
+
+const EMBED_BEGIN: &str = "#@sievectl-rules-begin";
+const EMBED_END: &str = "#@sievectl-rules-end";
+
+/// The rule set as TOML inside Sieve comments, so any machine can reopen
+/// the script on the server as editable rules.
+fn embed(set: &RuleSet) -> Result<String> {
+    let toml = toml::to_string(set)?;
+    let mut s = format!("\n{EMBED_BEGIN}\n");
+    for line in toml.lines() {
+        s.push_str("#@ ");
+        s.push_str(line);
+        s.push('\n');
+    }
+    s.push_str(EMBED_END);
+    s.push('\n');
+    Ok(s)
+}
+
+/// The script with the generated header and embedded rules block removed.
+pub fn without_embedded(script: &str) -> String {
+    let mut out = String::new();
+    let mut inside = false;
+    for l in script.lines() {
+        if l == EMBED_BEGIN {
+            inside = true;
+        } else if l == EMBED_END {
+            inside = false;
+        } else if !inside && format!("{l}\n") != HEADER {
+            out.push_str(l);
+            out.push('\n');
+        }
+    }
+    out.trim_end().to_string() + "\n"
+}
+
+/// Recover the rule set embedded by `compile`, if the script has one.
+pub fn extract(script: &str) -> Option<Result<RuleSet>> {
+    let mut lines = script.lines().map(|l| l.trim_end_matches('\r'));
+    lines.by_ref().find(|l| *l == EMBED_BEGIN)?;
+    let mut toml = String::new();
+    for l in lines {
+        if l == EMBED_END {
+            return Some(toml::from_str(&toml).context("embedded rules are corrupt"));
+        }
+        toml.push_str(
+            l.strip_prefix("#@ ")
+                .or_else(|| l.strip_prefix("#@"))
+                .unwrap_or(l),
+        );
+        toml.push('\n');
+    }
+    Some(Err(anyhow!("embedded rules block is not terminated")))
 }
 
 pub fn compile_rule(r: &Rule, req: &mut BTreeSet<&'static str>) -> Result<String> {
@@ -235,7 +292,11 @@ pub fn compile_rule(r: &Rule, req: &mut BTreeSet<&'static str>) -> Result<String
     let test = if tests.len() == 1 {
         tests[0].clone()
     } else {
-        let kw = if r.match_kind == MatchKind::Any { "anyof" } else { "allof" };
+        let kw = if r.match_kind == MatchKind::Any {
+            "anyof"
+        } else {
+            "allof"
+        };
         format!("{kw} (\n    {}\n)", tests.join(",\n    "))
     };
     out.push_str(&format!("if {test} {{\n"));
@@ -255,7 +316,14 @@ enum FieldKind {
 }
 
 const ADDRESS_FIELDS: &[&str] = &[
-    "from", "to", "cc", "bcc", "sender", "reply-to", "resent-from", "resent-to",
+    "from",
+    "to",
+    "cc",
+    "bcc",
+    "sender",
+    "reply-to",
+    "resent-from",
+    "resent-to",
 ];
 
 fn classify(field: &str) -> Result<(FieldKind, Option<&'static str>)> {
@@ -292,7 +360,11 @@ fn classify(field: &str) -> Result<(FieldKind, Option<&'static str>)> {
 fn compile_condition(c: &Condition, req: &mut BTreeSet<&'static str>) -> Result<String> {
     let (kind, part) = classify(&c.field)?;
     let vals = c.value.list();
-    let cmp = if c.case_sensitive { " :comparator \"i;octet\"" } else { "" };
+    let cmp = if c.case_sensitive {
+        " :comparator \"i;octet\""
+    } else {
+        ""
+    };
     let test = match c.op {
         Op::Exists => {
             let names: Vec<String> = match kind {
@@ -300,19 +372,30 @@ fn compile_condition(c: &Condition, req: &mut BTreeSet<&'static str>) -> Result<
                 FieldKind::Header(h) => vec![h],
                 _ => bail!("'exists' only works on header fields"),
             };
-            format!("exists {}", strlist(&names.iter().map(String::as_str).collect::<Vec<_>>()))
+            format!(
+                "exists {}",
+                strlist(&names.iter().map(String::as_str).collect::<Vec<_>>())
+            )
         }
         Op::Over | Op::Under => {
             if !matches!(kind, FieldKind::Size) {
                 bail!("over/under only apply to field \"size\"");
             }
-            let [v] = vals.as_slice() else { bail!("size needs exactly one value, e.g. \"5M\"") };
+            let [v] = vals.as_slice() else {
+                bail!("size needs exactly one value, e.g. \"5M\"")
+            };
             let v = v.trim().to_ascii_uppercase();
             let digits = v.trim_end_matches(['K', 'M', 'G']);
-            if digits.is_empty() || !digits.bytes().all(|b| b.is_ascii_digit()) || v.len() - digits.len() > 1 {
+            if digits.is_empty()
+                || !digits.bytes().all(|b| b.is_ascii_digit())
+                || v.len() - digits.len() > 1
+            {
                 bail!("invalid size {v:?} (use e.g. 500K, 5M, 1G)");
             }
-            format!("size :{} {v}", if c.op == Op::Over { "over" } else { "under" })
+            format!(
+                "size :{} {v}",
+                if c.op == Op::Over { "over" } else { "under" }
+            )
         }
         Op::Is | Op::Contains | Op::Matches | Op::Regex => {
             if matches!(kind, FieldKind::Size) {
@@ -352,7 +435,11 @@ fn compile_condition(c: &Condition, req: &mut BTreeSet<&'static str>) -> Result<
 
 fn compile_action(a: &Action, req: &mut BTreeSet<&'static str>) -> Result<String> {
     Ok(match a {
-        Action::Fileinto { folder, create, copy } => {
+        Action::Fileinto {
+            folder,
+            create,
+            copy,
+        } => {
             if folder.trim().is_empty() {
                 bail!("fileinto needs a folder");
             }
@@ -393,7 +480,13 @@ fn compile_action(a: &Action, req: &mut BTreeSet<&'static str>) -> Result<String
             req.insert("imap4flags");
             format!("addflag {};", strlist(&flags.list()))
         }
-        Action::Vacation { reason, subject, days, from, addresses } => {
+        Action::Vacation {
+            reason,
+            subject,
+            days,
+            from,
+            addresses,
+        } => {
             req.insert("vacation");
             let mut s = String::from("vacation");
             if let Some(d) = days {
@@ -430,7 +523,10 @@ fn strlist(v: &[&str]) -> String {
     if v.len() == 1 {
         quote(v[0])
     } else {
-        format!("[{}]", v.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", "))
+        format!(
+            "[{}]",
+            v.iter().map(|s| quote(s)).collect::<Vec<_>>().join(", ")
+        )
     }
 }
 
@@ -451,7 +547,9 @@ fn take_word(s: &str) -> (&str, &str) {
 
 fn unquote(s: &str) -> String {
     let t = s.trim();
-    if t.len() >= 2 && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\''))) {
+    if t.len() >= 2
+        && ((t.starts_with('"') && t.ends_with('"')) || (t.starts_with('\'') && t.ends_with('\'')))
+    {
         t[1..t.len() - 1].to_string()
     } else {
         t.to_string()
@@ -475,7 +573,10 @@ pub fn parse_condition(s: &str) -> Result<Condition> {
     let vals: Vec<String> = if rest.is_empty() {
         vec![]
     } else {
-        rest.split('|').map(unquote).filter(|v| !v.is_empty()).collect()
+        rest.split('|')
+            .map(unquote)
+            .filter(|v| !v.is_empty())
+            .collect()
     };
     let c = Condition {
         field: field.to_string(),
@@ -584,12 +685,18 @@ mod tests {
     fn example_compiles() {
         let set: RuleSet = toml::from_str(EXAMPLE).unwrap();
         let s = compile(&set).unwrap();
-        assert!(s.contains(r#"require ["fileinto", "imap4flags", "mailbox"];"#), "{s}");
+        assert!(
+            s.contains(r#"require ["fileinto", "imap4flags", "mailbox"];"#),
+            "{s}"
+        );
         assert!(s.contains(r#"address :domain :is "from" ["github.com", "githubusercontent.com"]"#));
         assert!(s.contains(r#"addflag "\\Seen";"#));
         assert!(s.contains("size :over 20M"));
         assert!(s.contains("# [disabled] Out of office"));
-        assert!(!s.contains("vacation"), "disabled rule must not add requires");
+        assert!(
+            !required(&s).contains(&"vacation".to_string()),
+            "disabled rule must not add requires"
+        );
         println!("{s}");
     }
 
@@ -597,11 +704,17 @@ mod tests {
     fn one_liners() {
         let c = parse_condition("subject not contains \"hello world\"|bye").unwrap();
         assert!(c.not);
-        assert_eq!(c.value, Values::Many(vec!["hello world".into(), "bye".into()]));
+        assert_eq!(
+            c.value,
+            Values::Many(vec!["hello world".into(), "bye".into()])
+        );
         assert!(parse_condition("size contains 5").is_err());
         assert!(parse_condition("subject.domain is x").is_err());
         assert!(parse_condition("list-id exists").is_ok());
-        assert!(matches!(parse_action("forward a@b.c", false).unwrap(), Action::Redirect { copy: true, .. }));
+        assert!(matches!(
+            parse_action("forward a@b.c", false).unwrap(),
+            Action::Redirect { copy: true, .. }
+        ));
         assert!(parse_action("redirect nobody", false).is_ok()); // validated at compile
     }
 
@@ -611,6 +724,16 @@ mod tests {
         let text = toml::to_string(&set).unwrap();
         let back: RuleSet = toml::from_str(&text).unwrap();
         assert_eq!(compile(&set).unwrap(), compile(&back).unwrap());
+    }
+
+    #[test]
+    fn embedded_roundtrip() {
+        let set: RuleSet = toml::from_str(EXAMPLE).unwrap();
+        let script = compile(&set).unwrap().replace('\n', "\r\n");
+        let back = extract(&script).unwrap().unwrap();
+        assert_eq!(back.rules.len(), set.rules.len());
+        assert_eq!(compile(&back).unwrap(), compile(&set).unwrap());
+        assert!(extract("keep;\n").is_none());
     }
 
     #[test]

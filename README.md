@@ -1,10 +1,41 @@
-# sievectl
+# Sieve Rules / sievectl
 
-Cross-platform (Linux, macOS, Windows) ManageSieve client (RFC 5804) with a
-rule builder: describe mail filters in a TOML file, and `sievectl` compiles
-them to Sieve (RFC 5228), validates them on the server, and uploads them.
+Cross-platform (Linux, macOS, Windows) ManageSieve client (RFC 5804) for
+building mail filter rules. Two programs share one core:
 
-Single static binary, pure-Rust TLS (rustls + ring); no OpenSSL needed.
+- **`sievectl-gui`**: desktop app with a point-and-click rule builder.
+- **`sievectl`**: command-line client for scripting.
+
+Rules compile to Sieve (RFC 5228), are validated by the server
+(CHECKSCRIPT) and uploaded. Pure-Rust TLS (rustls + ring); no OpenSSL.
+
+## GUI
+
+```sh
+cargo run --release --bin sievectl-gui
+```
+
+1. Enter server, username, password (STARTTLS on 4190 by default). Tick
+   *Remember password* to store it in the macOS Keychain, Windows Credential
+   Manager or the Linux Secret Service (GNOME Keyring/KWallet).
+2. Scripts on the server are listed on the left (★ = active). The active
+   script opens automatically. Right-click for activate/rename/delete.
+3. Build rules: pick a field (From, From domain, Subject, List-Id, Size, any
+   header…), an operator, and values (separate alternatives with `|`). Add
+   actions: move to folder, set flags (mark read), forward, discard, reject,
+   auto-reply. The generated Sieve for the selected rule updates live.
+4. **Check** asks the server to validate; **Save** (Ctrl/Cmd+S) validates and
+   uploads; **Save & activate** makes it the running script.
+
+The rule set is stored inside the uploaded script as a `#@` comment block,
+so any machine (GUI or CLI) can reopen it as editable rules. Scripts not made
+by this tool open in a raw Sieve editor with server-side validation.
+Connection settings persist between runs; the password only lives in the
+keychain.
+
+Linux build needs: `libxkbcommon-dev libwayland-dev libgl1-mesa-dev`
+(Debian/Ubuntu) or `libxkbcommon-devel wayland-devel mesa-libGL-devel` (Fedora).
+CLI only, no GUI deps: `cargo build --release --no-default-features`.
 
 ## Build
 
@@ -36,7 +67,9 @@ rules = "/home/you/mail/rules.toml"
 # password_command = "pass show mail/sieve"
 ```
 
-Password order: `$SIEVE_PASSWORD` → `password_command` → prompt.
+Password order: `$SIEVE_PASSWORD` → `password_command` → system keychain → prompt.
+`sievectl login` verifies and stores the password in the keychain (same entry
+the GUI uses); `sievectl login --forget` removes it.
 Every flag can override the profile: `-H host -u user -p 4190 --tls starttls|implicit|none --ca-file ca.pem`.
 Use `-P name` for another `[profile.name]`.
 
@@ -58,6 +91,7 @@ sievectl rule add -n "No-reply junk" --any \
   --then discard
 
 sievectl rule list | show NAME | disable NAME | enable NAME | move NAME 1 | rm NAME
+sievectl pull filters rules.toml # get rules back from a script on the server
 sievectl compile                 # print the generated Sieve
 sievectl deploy --activate       # CHECKSCRIPT, then PUTSCRIPT (skipped if unchanged), SETACTIVE
 sievectl deploy --dry-run        # validate on the server only
@@ -99,5 +133,7 @@ sievectl --debug ls              # protocol trace (password redacted)
 
 ## Tested
 
-Unit tests plus an end-to-end run against Dovecot 2.3 / Pigeonhole (STARTTLS,
-auth failure, CHECKSCRIPT errors, deploy, edit, rename, delete-active refusal).
+Unit tests plus end-to-end runs against Dovecot 2.3 / Pigeonhole: CLI
+(STARTTLS, auth failure, CHECKSCRIPT errors, deploy, edit, rename,
+delete-active refusal) and GUI (connect, reopen embedded rules, raw edit +
+server validation, unsaved-changes prompt, build and save a rule).
