@@ -1,12 +1,12 @@
 #!/usr/bin/env bash
-# Builds a universal (Apple Silicon + Intel) "Sieve Rules.app" and wraps it in
-# a drag-to-Applications DMG: dist/SieveRules-<version>.dmg
+# Builds a universal (Apple Silicon + Intel) "Vera Colander.app" and wraps it in
+# a drag-to-Applications DMG: dist/VeraColander-<version>.dmg
 set -euo pipefail
 
 cd "$(dirname "$0")/../.."
 export PATH="$HOME/.cargo/bin:$PATH"
 
-APP_NAME="Sieve Rules"
+APP_NAME="Vera Colander"
 BUNDLE_ID="io.github.jridder.veracolander"
 VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
 TARGETS=(aarch64-apple-darwin x86_64-apple-darwin)
@@ -75,7 +75,7 @@ STAGE="$BUILD/dmg"
 mkdir -p "$STAGE" dist
 cp -R "$APP" "$STAGE/"
 ln -s /Applications "$STAGE/Applications"
-DMG="dist/SieveRules-$VERSION.dmg"
+DMG="dist/VeraColander-$VERSION.dmg"
 rm -f "$DMG"
 hdiutil create -volname "$APP_NAME" -srcfolder "$STAGE" -fs HFS+ -format UDZO -ov "$DMG" >/dev/null
 

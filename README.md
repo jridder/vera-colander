@@ -1,4 +1,4 @@
-# Sieve Rules / sievectl
+# Vera Colander
 
 Cross-platform (Linux, macOS, Windows) ManageSieve client (RFC 5804) for
 building mail filter rules. Two programs share one core:

@@ -376,7 +376,7 @@ impl App {
     fn connect_view(&mut self, ui: &mut egui::Ui) {
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
-            ui.heading(RichText::new("Sieve Rules").size(26.0));
+            ui.heading(RichText::new("Vera Colander").size(26.0));
             ui.label("Connect to your mail server's ManageSieve service");
             ui.add_space(16.0);
         });
