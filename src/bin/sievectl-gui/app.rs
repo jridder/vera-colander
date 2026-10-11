@@ -104,6 +104,8 @@ pub struct App {
     status: Option<(String, bool)>,
     check: Option<Result<Option<String>, String>>,
     saving: Option<(String, String)>,
+    /// IMAP folder list for the picker; None while loading or disconnected.
+    folders: Option<Result<Vec<String>, String>>,
     allow_close: bool,
 }
 
@@ -141,6 +143,7 @@ impl App {
             status: None,
             check: None,
             saving: None,
+            folders: None,
             allow_close: false,
         }
     }
@@ -264,9 +267,12 @@ impl App {
                     self.worker.send(Req::Get(active.clone()));
                 }
                 self.scripts = scripts;
+                self.folders = None;
+                self.worker.send(Req::Folders);
             }
             Resp::Disconnected => {
                 self.conn = None;
+                self.folders = None;
                 self.scripts.clear();
                 self.doc = None;
                 self.info("Disconnected");
@@ -363,6 +369,7 @@ impl App {
                 }
                 self.info(format!("Renamed {old} to {new}"));
             }
+            Resp::Folders(r) => self.folders = Some(r),
             Resp::Error(e) => {
                 self.connecting = false;
                 self.saving = None;
@@ -750,6 +757,8 @@ impl App {
             return;
         };
         let sel = &mut self.sel;
+        let folders = self.folders.as_ref();
+        let mut reload = false;
         if sel.is_some_and(|i| i >= rules.len()) {
             *sel = rules.len().checked_sub(1);
         }
@@ -797,7 +806,7 @@ impl App {
                 let i = *i;
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| rule_editor(ui, &mut rules[i], i));
+                    .show(ui, |ui| rule_editor(ui, &mut rules[i], i, folders, &mut reload));
             }
             _ => {
                 ui.centered_and_justified(|ui| {
@@ -805,6 +814,10 @@ impl App {
                 });
             }
         });
+        if reload {
+            self.folders = None;
+            self.worker.send(Req::Folders);
+        }
     }
 
     fn status_bar(&mut self, ui: &mut egui::Ui) {
@@ -1088,7 +1101,13 @@ fn section(ui: &mut egui::Ui, title: &str) {
     ui.add_space(4.0);
 }
 
-fn rule_editor(ui: &mut egui::Ui, r: &mut UiRule, ri: usize) {
+fn rule_editor(
+    ui: &mut egui::Ui,
+    r: &mut UiRule,
+    ri: usize,
+    folders: Option<&Result<Vec<String>, String>>,
+    reload: &mut bool,
+) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
         ui.label("Name");
@@ -1136,7 +1155,7 @@ fn rule_editor(ui: &mut egui::Ui, r: &mut UiRule, ri: usize) {
     let mut up = None;
     let n = r.actions.len();
     for (ai, a) in r.actions.iter_mut().enumerate() {
-        let (rm, u) = action_row(ui, a, ri, ai, n);
+        let (rm, u) = action_row(ui, a, ri, ai, n, folders, reload);
         if rm {
             remove = Some(ai);
         }
@@ -1257,7 +1276,70 @@ fn condition_row(ui: &mut egui::Ui, c: &mut UiCond, ri: usize, ci: usize) -> boo
     remove
 }
 
-fn action_row(ui: &mut egui::Ui, a: &mut UiAction, ri: usize, ai: usize, n: usize) -> (bool, bool) {
+/// 📁 button next to a folder box: pick from the server's IMAP folders,
+/// filtered by what is already typed.
+fn folder_picker(
+    ui: &mut egui::Ui,
+    text: &mut String,
+    folders: Option<&Result<Vec<String>, String>>,
+    reload: &mut bool,
+    id: (usize, usize),
+) {
+    let btn = ui.button("📁").on_hover_text("Choose a folder on the server");
+    let popup_id = ui.make_persistent_id(("folders", id));
+    egui::Popup::menu(&btn)
+        .id(popup_id)
+        .close_behavior(egui::PopupCloseBehavior::CloseOnClickOutside)
+        .show(|ui| {
+            ui.set_min_width(260.0);
+            match folders {
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading folders…");
+                    });
+                }
+                Some(Err(e)) => {
+                    ui.colored_label(ui.visuals().error_fg_color, "Couldn't load folders");
+                    ui.label(RichText::new(e).small().weak());
+                    ui.label(RichText::new("You can still type the name.").small());
+                    if ui.button("⟳ Try again").clicked() {
+                        *reload = true;
+                    }
+                }
+                Some(Ok(list)) => {
+                    let q = text.trim().to_lowercase();
+                    let shown: Vec<&String> = list
+                        .iter()
+                        .filter(|f| q.is_empty() || f.to_lowercase().contains(&q))
+                        .collect();
+                    let shown = if shown.is_empty() { list.iter().collect() } else { shown };
+                    ScrollArea::vertical().max_height(320.0).show(ui, |ui| {
+                        for f in shown {
+                            if ui.selectable_label(text.trim() == f, f).clicked() {
+                                *text = f.clone();
+                                ui.close();
+                            }
+                        }
+                    });
+                    ui.separator();
+                    if ui.small_button("⟳ Reload list").clicked() {
+                        *reload = true;
+                    }
+                }
+            }
+        });
+}
+
+fn action_row(
+    ui: &mut egui::Ui,
+    a: &mut UiAction,
+    ri: usize,
+    ai: usize,
+    n: usize,
+    folders: Option<&Result<Vec<String>, String>>,
+    reload: &mut bool,
+) -> (bool, bool) {
     let mut remove = false;
     let mut up = false;
     egui::Frame::group(ui.style()).show(ui, |ui| {
@@ -1285,6 +1367,7 @@ fn action_row(ui: &mut egui::Ui, a: &mut UiAction, ri: usize, ai: usize, n: usiz
                             .hint_text("Folder, e.g. Lists/Debian")
                             .desired_width(200.0),
                     );
+                    folder_picker(ui, &mut a.text, folders, reload, (ri, ai));
                     ui.checkbox(&mut a.create, "Create if missing");
                     ui.checkbox(&mut a.copy, "Also keep in Inbox");
                 }

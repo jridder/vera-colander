@@ -25,6 +25,8 @@ pub enum Req {
     Activate(String),
     Delete(String),
     Rename(String, String),
+    /// Mail folders over IMAP (implicit TLS on 993), for the folder picker.
+    Folders,
 }
 
 pub enum Resp {
@@ -56,6 +58,8 @@ pub enum Resp {
         new: String,
         scripts: Scripts,
     },
+    /// Separate from `Error`: a failed folder list shouldn't flag the session.
+    Folders(Result<Vec<String>, String>),
     Error(String),
 }
 
@@ -237,6 +241,20 @@ impl State {
                     c.list_scripts()
                 })?;
                 Ok(Resp::Renamed { old, new, scripts })
+            }
+            Req::Folders => {
+                let (opts, user, pass) = self
+                    .creds
+                    .as_ref()
+                    .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+                let r = sievectl::imap::list_folders(
+                    &opts.host,
+                    993,
+                    opts.ca_file.as_deref(),
+                    user,
+                    pass,
+                );
+                Ok(Resp::Folders(r.map_err(|e| format!("{e:#}"))))
             }
         })();
         r.unwrap_or_else(|e| Resp::Error(format!("{e:#}")))

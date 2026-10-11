@@ -24,6 +24,8 @@ cargo run --release --bin sievectl-gui
    header…), an operator, and values (separate alternatives with `|`). Add
    actions: move to folder, set flags (mark read), forward, discard, reject,
    auto-reply. The generated Sieve for the selected rule updates live.
+   The 📁 button next to a folder lists your mailboxes (fetched over IMAP on
+   port 993 with the same login); you can also type a name.
 4. **Check** asks the server to validate; **Save** (Ctrl/Cmd+S) validates and
    uploads; **Save & activate** makes it the running script.
 

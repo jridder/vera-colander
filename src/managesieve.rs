@@ -133,32 +133,7 @@ pub struct Client {
 
 impl Client {
     pub fn connect(o: &ConnectOptions) -> Result<Client> {
-        let addrs: Vec<_> = (o.host.as_str(), o.port)
-            .to_socket_addrs()
-            .with_context(|| format!("resolving {}", o.host))?
-            .collect();
-        let mut last = None;
-        let mut tcp = None;
-        for a in &addrs {
-            match TcpStream::connect_timeout(a, Duration::from_secs(15)) {
-                Ok(s) => {
-                    tcp = Some(s);
-                    break;
-                }
-                Err(e) => last = Some(e),
-            }
-        }
-        let tcp = tcp.ok_or_else(|| {
-            anyhow!(
-                "could not connect to {}:{}: {}",
-                o.host,
-                o.port,
-                last.map(|e| e.to_string())
-                    .unwrap_or_else(|| "no addresses".into())
-            )
-        })?;
-        tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
-        tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
+        let tcp = tcp_connect(&o.host, o.port)?;
 
         let mut stream: Box<dyn Stream> = Box::new(tcp);
         let mut tls_active = false;
@@ -516,7 +491,38 @@ fn push_literal(out: &mut Vec<u8>, data: &[u8]) {
     out.extend_from_slice(data);
 }
 
-fn tls_wrap(
+/// TCP connection with connect/read/write timeouts.
+pub(crate) fn tcp_connect(host: &str, port: u16) -> Result<TcpStream> {
+    let addrs: Vec<_> = (host, port)
+        .to_socket_addrs()
+        .with_context(|| format!("resolving {}", host))?
+        .collect();
+    let mut last = None;
+    let mut tcp = None;
+    for a in &addrs {
+        match TcpStream::connect_timeout(a, Duration::from_secs(15)) {
+            Ok(s) => {
+                tcp = Some(s);
+                break;
+            }
+            Err(e) => last = Some(e),
+        }
+    }
+    let tcp = tcp.ok_or_else(|| {
+        anyhow!(
+            "could not connect to {}:{}: {}",
+            host,
+            port,
+            last.map(|e| e.to_string())
+                .unwrap_or_else(|| "no addresses".into())
+        )
+    })?;
+    tcp.set_read_timeout(Some(Duration::from_secs(60)))?;
+    tcp.set_write_timeout(Some(Duration::from_secs(60)))?;
+    Ok(tcp)
+}
+
+pub(crate) fn tls_wrap(
     stream: Box<dyn Stream>,
     host: &str,
     ca_file: Option<&Path>,
