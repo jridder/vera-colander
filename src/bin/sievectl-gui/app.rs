@@ -1,5 +1,5 @@
 use crate::model::*;
-use crate::worker::{Req, Resp, Scripts, Worker};
+use crate::worker::{InboxView, Req, Resp, Scripts, Worker};
 use egui::{
     Align, Color32, ComboBox, Key, KeyboardShortcut, Layout, Modifiers, RichText, ScrollArea,
     TextEdit,
@@ -76,6 +76,14 @@ enum Modal {
     Delete(String),
     Discard(After),
     ToRaw,
+    /// Applying rules to messages already in the Inbox.
+    Inbox { label: String, state: InboxState },
+}
+
+enum InboxState {
+    Scanning,
+    Preview(InboxView),
+    Applying,
 }
 
 #[derive(PartialEq, Clone, Copy)]
@@ -253,6 +261,15 @@ impl App {
         }
     }
 
+    /// Preview `rules` against the Inbox; the modal then offers to apply them.
+    fn run_inbox(&mut self, rules: Vec<rules::Rule>, label: String) {
+        self.modal = Some(Modal::Inbox {
+            label,
+            state: InboxState::Scanning,
+        });
+        self.worker.send(Req::InboxPreview(rules));
+    }
+
     fn check(&mut self) {
         let Some(doc) = &self.doc else { return };
         match doc.compiled() {
@@ -370,6 +387,30 @@ impl App {
                         ""
                     }
                 ));
+                // Rules ticked "apply to the Inbox when I save".
+                let mut run = Vec::new();
+                if let Some(Doc {
+                    name: dn,
+                    mode: DocMode::Rules(rs),
+                    ..
+                }) = &mut self.doc
+                {
+                    if *dn == name {
+                        for r in rs.iter_mut().filter(|r| r.run_now) {
+                            r.run_now = false;
+                            if let (true, Ok(rule)) = (r.enabled, r.to_rule()) {
+                                run.push(rule);
+                            }
+                        }
+                    }
+                }
+                if !run.is_empty() {
+                    let label = match run.as_slice() {
+                        [one] => one.name.clone(),
+                        many => format!("{} rules", many.len()),
+                    };
+                    self.run_inbox(run, label);
+                }
             }
             Resp::Deleted { name, scripts } => {
                 self.scripts = scripts;
@@ -388,6 +429,36 @@ impl App {
                 self.info(format!("Renamed {old} to {new}"));
             }
             Resp::Folders(r) => self.folders = Some(r),
+            Resp::InboxPreview(r) => {
+                let inbox_open = matches!(self.modal, Some(Modal::Inbox { .. }));
+                match r {
+                    Ok(v) => {
+                        if let Some(Modal::Inbox { state, .. }) = &mut self.modal {
+                            *state = InboxState::Preview(v);
+                        } else if self.modal.is_none() {
+                            self.modal = Some(Modal::Inbox {
+                                label: "Rules".into(),
+                                state: InboxState::Preview(v),
+                            });
+                        }
+                    }
+                    Err(e) => {
+                        if inbox_open {
+                            self.modal = None;
+                        }
+                        self.error(format!("Couldn't check the Inbox: {e}"));
+                    }
+                }
+            }
+            Resp::InboxApplied(r) => {
+                if matches!(self.modal, Some(Modal::Inbox { .. })) {
+                    self.modal = None;
+                }
+                match r {
+                    Ok(summary) => self.info(format!("Inbox: {summary}")),
+                    Err(e) => self.error(format!("Couldn't finish applying the rule: {e}")),
+                }
+            }
             Resp::Error(e) => {
                 self.connecting = false;
                 self.auto_connecting = false;
@@ -796,6 +867,7 @@ impl App {
         let sel = &mut self.sel;
         let folders = self.folders.as_ref();
         let mut reload = false;
+        let mut run = false;
         if sel.is_some_and(|i| i >= rules.len()) {
             *sel = rules.len().checked_sub(1);
         }
@@ -843,7 +915,9 @@ impl App {
                 let i = *i;
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
-                    .show(ui, |ui| rule_editor(ui, &mut rules[i], i, folders, &mut reload));
+                    .show(ui, |ui| {
+                        rule_editor(ui, &mut rules[i], i, folders, &mut reload, &mut run)
+                    });
             }
             _ => {
                 ui.centered_and_justified(|ui| {
@@ -854,6 +928,20 @@ impl App {
         if reload {
             self.folders = None;
             self.worker.send(Req::Folders);
+        }
+        if run {
+            let picked = match &self.doc {
+                Some(Doc {
+                    mode: DocMode::Rules(rs),
+                    ..
+                }) => self.sel.and_then(|i| rs.get(i)).map(|r| (r.name.clone(), r.to_rule())),
+                _ => None,
+            };
+            match picked {
+                Some((name, Ok(rule))) => self.run_inbox(vec![rule], name),
+                Some((_, Err(e))) => self.error(format!("Fix the rule first: {e:#}")),
+                None => {}
+            }
         }
     }
 
@@ -980,6 +1068,85 @@ impl App {
                         }
                     });
                 }
+                Modal::Inbox { label, state } => match state {
+                    InboxState::Scanning => {
+                        ui.heading(format!("Checking the Inbox for “{label}”"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Reading messages…");
+                        });
+                    }
+                    InboxState::Applying => {
+                        ui.heading(format!("Applying “{label}”"));
+                        ui.add_space(8.0);
+                        ui.horizontal(|ui| {
+                            ui.spinner();
+                            ui.label("Working…");
+                        });
+                    }
+                    InboxState::Preview(v) => {
+                        ui.set_width(760.0);
+                        ui.heading(format!("Apply “{label}” to the Inbox"));
+                        ui.label(format!(
+                            "{} of {} Inbox messages would change.",
+                            v.rows.len(),
+                            v.scanned
+                        ));
+                        for n in &v.notes {
+                            ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {n}"));
+                        }
+                        if !v.rows.is_empty() {
+                            ui.add_space(6.0);
+                            let row_h = ui.text_style_height(&egui::TextStyle::Body) + 6.0;
+                            ScrollArea::vertical()
+                                .max_height(360.0)
+                                .auto_shrink([false, true])
+                                .show_rows(ui, row_h, v.rows.len(), |ui, range| {
+                                    egui::Grid::new("inbox_rows")
+                                        .striped(true)
+                                        .num_columns(4)
+                                        .min_row_height(row_h)
+                                        .show(ui, |ui| {
+                                            for r in &v.rows[range] {
+                                                ui.label(RichText::new(&r.date).weak());
+                                                ui.add(egui::Label::new(&r.from).truncate())
+                                                    .on_hover_text(&r.from);
+                                                ui.add_sized(
+                                                    [300.0, row_h],
+                                                    egui::Label::new(&r.subject).truncate(),
+                                                )
+                                                .on_hover_text(&r.subject);
+                                                ui.label(RichText::new(&r.outcome).strong());
+                                                ui.end_row();
+                                            }
+                                        });
+                                });
+                        }
+                        ui.add_space(8.0);
+                        let mut apply = false;
+                        ui.horizontal(|ui| {
+                            let n = v.rows.len();
+                            if n > 0
+                                && ui
+                                    .button(format!(
+                                        "Apply to {n} message{}",
+                                        if n == 1 { "" } else { "s" }
+                                    ))
+                                    .clicked()
+                            {
+                                apply = true;
+                            }
+                            if ui.button(if n > 0 { "Cancel" } else { "Close" }).clicked() {
+                                keep = false;
+                            }
+                        });
+                        if apply {
+                            self.worker.send(Req::InboxApply);
+                            *state = InboxState::Applying;
+                        }
+                    }
+                },
                 Modal::ToRaw => {
                     ui.heading("Convert to raw Sieve?");
                     ui.label("You'll be able to hand-edit the script, but it can no longer be edited with the rule builder.");
@@ -1144,6 +1311,7 @@ fn rule_editor(
     ri: usize,
     folders: Option<&Result<Vec<String>, String>>,
     reload: &mut bool,
+    run: &mut bool,
 ) {
     ui.add_space(6.0);
     ui.horizontal(|ui| {
@@ -1227,6 +1395,21 @@ fn rule_editor(
         &mut r.stop,
         "Stop here: don't run later rules when this one matches",
     );
+
+    section(ui, "Mail already in the Inbox");
+    ui.label(
+        RichText::new("Filters only run on new mail. These apply the rule to what's already there.")
+            .weak(),
+    );
+    ui.checkbox(&mut r.run_now, "Apply to the Inbox when I save")
+        .on_hover_text("After the next Save, preview the matching Inbox messages and confirm");
+    if ui
+        .button("▶ Run on Inbox now…")
+        .on_hover_text("Preview which Inbox messages this rule matches, then apply it")
+        .clicked()
+    {
+        *run = true;
+    }
     ui.add_space(12.0);
 }
 

@@ -307,7 +307,7 @@ pub fn compile_rule(r: &Rule, req: &mut BTreeSet<&'static str>) -> Result<String
     Ok(out)
 }
 
-enum FieldKind {
+pub(crate) enum FieldKind {
     Address(Vec<&'static str>),
     Envelope(&'static str),
     Header(String),
@@ -326,7 +326,7 @@ const ADDRESS_FIELDS: &[&str] = &[
     "resent-to",
 ];
 
-fn classify(field: &str) -> Result<(FieldKind, Option<&'static str>)> {
+pub(crate) fn classify(field: &str) -> Result<(FieldKind, Option<&'static str>)> {
     let f = field.trim().to_ascii_lowercase();
     let (base, part) = match f.rsplit_once('.') {
         Some((b, "domain")) => (b.to_string(), Some(":domain")),

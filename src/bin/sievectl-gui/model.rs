@@ -11,6 +11,9 @@ pub struct UiRule {
     pub stop: bool,
     pub conds: Vec<UiCond>,
     pub actions: Vec<UiAction>,
+    /// Apply to messages already in the Inbox after the next save. UI-only:
+    /// not part of the compiled script.
+    pub run_now: bool,
 }
 
 #[derive(Clone)]
@@ -103,6 +106,7 @@ impl UiRule {
             stop: true,
             conds: vec![UiCond::new()],
             actions: vec![UiAction::new(ActKind::Fileinto)],
+            run_now: false,
         }
     }
 
@@ -177,6 +181,7 @@ impl UiRule {
                 })
                 .collect(),
             actions,
+            run_now: false,
         }
     }
 

@@ -1,7 +1,9 @@
 //! Background thread that owns the ManageSieve connection. The UI sends one
 //! `Req`, the worker answers with exactly one `Resp` and requests a repaint.
 
+use sievectl::inbox::{self, Account, Plan, Row};
 use sievectl::managesieve::{Capabilities, Client, ConnectOptions};
+use sievectl::rules::Rule;
 use std::sync::mpsc::{channel, Receiver, Sender};
 use std::thread;
 
@@ -27,6 +29,16 @@ pub enum Req {
     Rename(String, String),
     /// Mail folders over IMAP (implicit TLS on 993), for the folder picker.
     Folders,
+    /// Work out what these rules would do to messages already in the Inbox.
+    InboxPreview(Vec<Rule>),
+    /// Carry out the last preview.
+    InboxApply,
+}
+
+pub struct InboxView {
+    pub scanned: usize,
+    pub rows: Vec<Row>,
+    pub notes: Vec<String>,
 }
 
 pub enum Resp {
@@ -60,6 +72,8 @@ pub enum Resp {
     },
     /// Separate from `Error`: a failed folder list shouldn't flag the session.
     Folders(Result<Vec<String>, String>),
+    InboxPreview(Result<InboxView, String>),
+    InboxApplied(Result<String, String>),
     Error(String),
 }
 
@@ -113,6 +127,7 @@ impl Worker {
 struct State {
     client: Option<Client>,
     creds: Option<(ConnectOptions, String, String)>,
+    plan: Option<Plan>,
 }
 
 fn is_connection_error(e: &anyhow::Error) -> bool {
@@ -120,6 +135,21 @@ fn is_connection_error(e: &anyhow::Error) -> bool {
 }
 
 impl State {
+    fn account(&self) -> anyhow::Result<Account> {
+        let (opts, user, pass) = self
+            .creds
+            .as_ref()
+            .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+        Ok(Account {
+            host: opts.host.clone(),
+            ca_file: opts.ca_file.clone(),
+            user: user.clone(),
+            pass: pass.clone(),
+            imap_port: 993,
+            smtp_port: 465,
+        })
+    }
+
     fn open(&mut self) -> anyhow::Result<()> {
         let (opts, user, pass) = self
             .creds
@@ -243,18 +273,35 @@ impl State {
                 Ok(Resp::Renamed { old, new, scripts })
             }
             Req::Folders => {
-                let (opts, user, pass) = self
-                    .creds
-                    .as_ref()
-                    .ok_or_else(|| anyhow::anyhow!("not connected"))?;
+                let a = self.account()?;
                 let r = sievectl::imap::list_folders(
-                    &opts.host,
-                    993,
-                    opts.ca_file.as_deref(),
-                    user,
-                    pass,
+                    &a.host,
+                    a.imap_port,
+                    a.ca_file.as_deref(),
+                    &a.user,
+                    &a.pass,
                 );
                 Ok(Resp::Folders(r.map_err(|e| format!("{e:#}"))))
+            }
+            Req::InboxPreview(rules) => {
+                self.plan = None;
+                let r = inbox::preview(&self.account()?, &rules).map(|p| {
+                    self.plan = Some(p.plan);
+                    InboxView {
+                        scanned: p.scanned,
+                        rows: p.rows,
+                        notes: p.notes,
+                    }
+                });
+                Ok(Resp::InboxPreview(r.map_err(|e| format!("{e:#}"))))
+            }
+            Req::InboxApply => {
+                let plan = self
+                    .plan
+                    .take()
+                    .ok_or_else(|| anyhow::anyhow!("nothing to apply"))?;
+                let r = inbox::apply(&self.account()?, &plan);
+                Ok(Resp::InboxApplied(r.map_err(|e| format!("{e:#}"))))
             }
         })();
         r.unwrap_or_else(|e| Resp::Error(format!("{e:#}")))
