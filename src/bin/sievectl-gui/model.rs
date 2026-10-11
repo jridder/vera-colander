@@ -1,7 +1,7 @@
 //! Editable mirror of `sievectl::rules` with plain text buffers for the UI.
 
 use anyhow::{bail, Result};
-use sievectl::rules::{Action, Condition, MatchKind, Op, Rule, RuleSet, Values};
+use sievectl::rules::{Action, Condition, Group, MatchKind, Op, Rule, RuleSet, Values};
 
 #[derive(Clone)]
 pub struct UiRule {
@@ -14,6 +14,37 @@ pub struct UiRule {
     /// Apply to messages already in the Inbox after the next save. UI-only:
     /// not part of the compiled script.
     pub run_now: bool,
+    /// Hand-written Sieve block instead of conditions/actions.
+    pub raw: Option<String>,
+}
+
+#[derive(Clone)]
+pub struct UiGroup {
+    pub name: String,
+    pub enabled: bool,
+    /// UI-only: rules hidden in the sidebar.
+    pub collapsed: bool,
+    pub rules: Vec<UiRule>,
+}
+
+impl UiGroup {
+    pub fn new(name: impl Into<String>) -> Self {
+        UiGroup {
+            name: name.into(),
+            enabled: true,
+            collapsed: false,
+            rules: Vec::new(),
+        }
+    }
+
+    pub fn from_group(g: &Group) -> Self {
+        UiGroup {
+            name: g.name.clone(),
+            enabled: g.enabled,
+            collapsed: false,
+            rules: g.rules.iter().map(UiRule::from_rule).collect(),
+        }
+    }
 }
 
 #[derive(Clone)]
@@ -107,6 +138,18 @@ impl UiRule {
             conds: vec![UiCond::new()],
             actions: vec![UiAction::new(ActKind::Fileinto)],
             run_now: false,
+            raw: None,
+        }
+    }
+
+    pub fn new_raw(n: usize) -> Self {
+        UiRule {
+            name: format!("Raw Sieve {n}"),
+            stop: false,
+            conds: Vec::new(),
+            actions: Vec::new(),
+            raw: Some("# Hand-written Sieve, inserted here as-is.\n# require lines are moved to the top of the script.\n".into()),
+            ..UiRule::new(n)
         }
     }
 
@@ -182,10 +225,22 @@ impl UiRule {
                 .collect(),
             actions,
             run_now: false,
+            raw: r.raw.clone(),
         }
     }
 
     pub fn to_rule(&self) -> Result<Rule> {
+        if let Some(raw) = &self.raw {
+            return Ok(Rule {
+                name: self.name.trim().to_string(),
+                enabled: self.enabled,
+                raw: Some(raw.clone()),
+                match_kind: MatchKind::All,
+                conditions: Vec::new(),
+                actions: Vec::new(),
+                stop: false,
+            });
+        }
         let split = |s: &str, sep: char| -> Vec<String> {
             s.split(sep)
                 .map(|v| v.trim().to_string())
@@ -259,6 +314,7 @@ impl UiRule {
         Ok(Rule {
             name: self.name.trim().to_string(),
             enabled: self.enabled,
+            raw: None,
             match_kind: if self.any {
                 MatchKind::Any
             } else {
@@ -271,15 +327,25 @@ impl UiRule {
     }
 }
 
-pub fn to_ruleset(rules: &[UiRule]) -> Result<RuleSet> {
-    let mut v = Vec::new();
-    for (i, r) in rules.iter().enumerate() {
-        v.push(
-            r.to_rule()
-                .map_err(|e| anyhow::anyhow!("rule #{} {:?}: {e}", i + 1, r.name))?,
-        );
+pub fn to_ruleset(groups: &[UiGroup]) -> Result<RuleSet> {
+    let mut out = Vec::new();
+    for g in groups {
+        let mut rules = Vec::new();
+        for (i, r) in g.rules.iter().enumerate() {
+            rules.push(r.to_rule().map_err(|e| {
+                anyhow::anyhow!("group {:?}, rule #{} {:?}: {e}", g.name, i + 1, r.name)
+            })?);
+        }
+        out.push(Group {
+            name: g.name.trim().to_string(),
+            enabled: g.enabled,
+            rules,
+        });
     }
-    Ok(RuleSet { rules: v })
+    Ok(RuleSet {
+        groups: out,
+        rules: Vec::new(),
+    })
 }
 
 /// (field key, label) shown in the condition field picker.

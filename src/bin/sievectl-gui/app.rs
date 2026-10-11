@@ -6,7 +6,7 @@ use egui::{
 };
 use serde::{Deserialize, Serialize};
 use sievectl::managesieve::{ConnectOptions, TlsMode};
-use sievectl::rules::{self, Op};
+use sievectl::rules::{self, Op, SCRIPT_NAME};
 use std::path::PathBuf;
 
 const SAVE: KeyboardShortcut = KeyboardShortcut::new(Modifiers::COMMAND, Key::S);
@@ -21,6 +21,8 @@ struct Settings {
     ca_file: String,
     remember: bool,
     allow_plaintext: bool,
+    /// Show the raw server scripts, for debugging.
+    advanced: bool,
 }
 
 impl Default for Settings {
@@ -33,49 +35,109 @@ impl Default for Settings {
             ca_file: String::new(),
             remember: true,
             allow_plaintext: false,
+            advanced: false,
         }
     }
 }
 
-enum DocMode {
-    Rules(Vec<UiRule>),
-    Raw(String),
-}
-
-struct Doc {
-    name: String,
+/// All of the user's groups and rules: the one "vera-colander" script.
+struct Workspace {
+    groups: Vec<UiGroup>,
+    /// The script as it is on the server ("" when there is none yet).
     original: String,
-    mode: DocMode,
     on_server: bool,
     note: Option<String>,
 }
 
-impl Doc {
-    fn compiled(&self) -> anyhow::Result<String> {
-        match &self.mode {
-            DocMode::Rules(r) => rules::compile(&to_ruleset(r)?),
-            DocMode::Raw(t) => Ok(t.clone()),
+impl Workspace {
+    fn empty() -> Self {
+        Workspace {
+            groups: Vec::new(),
+            original: String::new(),
+            on_server: false,
+            note: None,
         }
     }
-    fn dirty(&self) -> bool {
-        !self.on_server || self.compiled().map(|s| s != self.original).unwrap_or(true)
+
+    /// Open the server's "vera-colander" script.
+    fn from_script(content: &str) -> Self {
+        let content = content.replace("\r\n", "\n");
+        match rules::extract(&content) {
+            Some(Ok(set)) => {
+                let set = set.grouped(rules::DEFAULT_GROUP);
+                Workspace {
+                    original: rules::compile(&set).unwrap_or_else(|_| content.clone()),
+                    groups: set.groups.iter().map(UiGroup::from_group).collect(),
+                    on_server: true,
+                    note: None,
+                }
+            }
+            other => {
+                // Someone else wrote a script with our name: keep it as raw Sieve.
+                let mut g = UiGroup::new(SCRIPT_NAME);
+                let mut r = UiRule::new_raw(1);
+                r.name = format!("Existing “{SCRIPT_NAME}” script");
+                r.raw = Some(content.trim_end().to_string() + "\n");
+                g.rules.push(r);
+                Workspace {
+                    groups: vec![g],
+                    original: content.clone(),
+                    on_server: true,
+                    note: Some(match other {
+                        Some(Err(e)) => format!("The saved rules couldn't be read ({e:#}), so the script was opened as raw Sieve."),
+                        _ => format!("“{SCRIPT_NAME}” on the server wasn't made by this app, so it was opened as raw Sieve."),
+                    }),
+                }
+            }
+        }
     }
+
+    fn compiled(&self) -> anyhow::Result<String> {
+        rules::compile(&to_ruleset(&self.groups)?)
+    }
+
+    fn dirty(&self) -> bool {
+        match self.compiled() {
+            Ok(s) if self.on_server => s != self.original,
+            Ok(_) => !self.groups.is_empty(),
+            Err(_) => true,
+        }
+    }
+
+    fn unique_name(&self, base: &str) -> String {
+        let taken = |n: &str| self.groups.iter().any(|g| g.name.eq_ignore_ascii_case(n));
+        if !taken(base) {
+            return base.to_string();
+        }
+        (2..).map(|i| format!("{base} ({i})")).find(|n| !taken(n)).unwrap()
+    }
+}
+
+#[derive(Clone, Copy, PartialEq)]
+enum Sel {
+    Group(usize),
+    Rule(usize, usize),
 }
 
 #[derive(Clone)]
 enum After {
-    Open(String),
-    NewScript,
     LogOut,
     Quit,
 }
 
+struct ImportItem {
+    name: String,
+    active: bool,
+    pick: bool,
+}
+
 enum Modal {
-    NewScript { name: String, raw: bool },
-    Rename { old: String, new: String },
-    Delete(String),
     Discard(After),
-    ToRaw,
+    /// Offer to bring the server's other scripts in as groups.
+    Import(Vec<ImportItem>),
+    /// After an import was saved: delete the scripts it came from?
+    DeleteOld(Vec<String>),
+    DeleteGroup(usize),
     /// Applying rules to messages already in the Inbox.
     Inbox { label: String, state: InboxState },
 }
@@ -90,6 +152,7 @@ enum InboxState {
 enum Tab {
     Rules,
     Sieve,
+    Server,
 }
 
 struct Conn {
@@ -107,15 +170,21 @@ pub struct App {
     /// Signing in on launch with the saved password: show a splash, not the form.
     auto_connecting: bool,
     scripts: Scripts,
-    doc: Option<Doc>,
-    sel: Option<usize>,
+    ws: Option<Workspace>,
+    sel: Option<Sel>,
     tab: Tab,
     modal: Option<Modal>,
     status: Option<(String, bool)>,
     check: Option<Result<Option<String>, String>>,
-    saving: Option<(String, String)>,
+    /// The compiled script being uploaded.
+    saving: Option<String>,
     /// IMAP folder list for the picker; None while loading or disconnected.
     folders: Option<Result<Vec<String>, String>>,
+    /// Scripts imported into the workspace, offered for deletion after a save.
+    imported: Vec<String>,
+    /// Advanced: a server script opened read-only, and the one requested.
+    server_view: Option<(String, String)>,
+    viewing: Option<String>,
     allow_close: bool,
 }
 
@@ -124,6 +193,15 @@ fn keyring_entry(s: &Settings) -> Option<keyring::Entry> {
         return None;
     }
     sievectl::config::keychain_entry(&s.user, &s.host).ok()
+}
+
+/// Sidebar edits, applied after drawing so the loops can borrow freely.
+enum Edit {
+    AddGroup,
+    MoveGroup(usize, isize),
+    AddRule(usize, bool),
+    MoveRule(usize, usize, isize),
+    DeleteRule(usize, usize),
 }
 
 impl App {
@@ -147,7 +225,7 @@ impl App {
             connecting: false,
             auto_connecting: false,
             scripts: Vec::new(),
-            doc: None,
+            ws: None,
             sel: None,
             tab: Tab::Rules,
             modal: None,
@@ -155,6 +233,9 @@ impl App {
             check: None,
             saving: None,
             folders: None,
+            imported: Vec::new(),
+            server_view: None,
+            viewing: None,
             allow_close: false,
         };
         if app.s.remember
@@ -175,12 +256,27 @@ impl App {
         self.status = Some((m.into(), true));
     }
 
-    fn is_active(&self, name: &str) -> bool {
-        self.scripts.iter().any(|(n, a)| n == name && *a)
+    fn active_script(&self) -> Option<&str> {
+        self.scripts
+            .iter()
+            .find(|(_, a)| *a)
+            .map(|(n, _)| n.as_str())
     }
 
     fn dirty(&self) -> bool {
-        self.doc.as_ref().is_some_and(Doc::dirty)
+        self.ws.as_ref().is_some_and(Workspace::dirty)
+    }
+
+    fn import_items(&self) -> Vec<ImportItem> {
+        self.scripts
+            .iter()
+            .filter(|(n, _)| n != SCRIPT_NAME)
+            .map(|(n, a)| ImportItem {
+                name: n.clone(),
+                active: *a,
+                pick: true,
+            })
+            .collect()
     }
 
     // ---- actions -----------------------------------------------------------
@@ -214,20 +310,13 @@ impl App {
 
     fn after(&mut self, a: After, ctx: &egui::Context) {
         match a {
-            After::Open(n) => self.worker.send(Req::Get(n)),
-            After::NewScript => {
-                self.modal = Some(Modal::NewScript {
-                    name: String::new(),
-                    raw: false,
-                })
-            }
             After::LogOut => {
                 // Forget the saved password so the next launch shows the login form.
                 if let Some(e) = keyring_entry(&self.s) {
                     let _ = e.delete_credential();
                 }
                 self.password.clear();
-                self.doc = None;
+                self.ws = None;
                 self.worker.send(Req::Disconnect);
             }
             After::Quit => {
@@ -237,7 +326,7 @@ impl App {
         }
     }
 
-    /// Run `a` now, or ask first if the open script has unsaved changes.
+    /// Run `a` now, or ask first if there are unsaved changes.
     fn guard(&mut self, a: After, ctx: &egui::Context) {
         if self.dirty() {
             self.modal = Some(Modal::Discard(a));
@@ -246,15 +335,16 @@ impl App {
         }
     }
 
-    fn save(&mut self, activate: bool) {
-        let Some(doc) = &self.doc else { return };
-        match doc.compiled() {
+    /// CHECKSCRIPT, PUTSCRIPT "vera-colander", SETACTIVE "vera-colander".
+    fn save(&mut self) {
+        let Some(ws) = &self.ws else { return };
+        match ws.compiled() {
             Ok(script) => {
-                self.saving = Some((doc.name.clone(), script.clone()));
+                self.saving = Some(script.clone());
                 self.worker.send(Req::Save {
-                    name: doc.name.clone(),
+                    name: SCRIPT_NAME.into(),
                     script,
-                    activate,
+                    activate: true,
                 });
             }
             Err(e) => self.error(format!("Can't save: {e:#}")),
@@ -271,11 +361,43 @@ impl App {
     }
 
     fn check(&mut self) {
-        let Some(doc) = &self.doc else { return };
-        match doc.compiled() {
+        let Some(ws) = &self.ws else { return };
+        match ws.compiled() {
             Ok(script) => self.worker.send(Req::Check(script)),
             Err(e) => self.check = Some(Err(format!("{e:#}"))),
         }
+    }
+
+    /// Add fetched scripts to the workspace as groups. Only the active one
+    /// was running, so the others come in disabled.
+    fn import(&mut self, fetched: Vec<(String, String)>) {
+        let active = self.active_script().map(str::to_string);
+        let ws = self.ws.get_or_insert_with(Workspace::empty);
+        let first = ws.groups.len();
+        let mut names = Vec::new();
+        for (name, content) in fetched {
+            if name == SCRIPT_NAME {
+                continue;
+            }
+            let live = active.as_deref() == Some(name.as_str());
+            for g in rules::import_script(&name, &content, live) {
+                let mut ug = UiGroup::from_group(&g);
+                ug.name = ws.unique_name(&ug.name);
+                ws.groups.push(ug);
+            }
+            names.push(name);
+        }
+        if names.is_empty() {
+            return;
+        }
+        ws.note = Some(format!(
+            "Imported {} script{} as groups. Check them over, then Save to make them live.",
+            names.len(),
+            if names.len() == 1 { "" } else { "s" }
+        ));
+        self.sel = (first < ws.groups.len()).then_some(Sel::Group(first));
+        self.tab = Tab::Rules;
+        self.imported = names;
     }
 
     fn handle(&mut self, r: Resp) {
@@ -298,10 +420,17 @@ impl App {
                     server: caps.get("IMPLEMENTATION").unwrap_or("").to_string(),
                     extensions: caps.sieve_extensions(),
                 });
-                if let Some((active, _)) = scripts.iter().find(|(_, a)| *a) {
-                    self.worker.send(Req::Get(active.clone()));
-                }
                 self.scripts = scripts;
+                if self.scripts.iter().any(|(n, _)| n == SCRIPT_NAME) {
+                    self.worker.send(Req::Get(SCRIPT_NAME.into()));
+                } else {
+                    // First connect: start empty and offer the existing scripts.
+                    self.ws = Some(Workspace::empty());
+                    let items = self.import_items();
+                    if !items.is_empty() {
+                        self.modal = Some(Modal::Import(items));
+                    }
+                }
                 self.folders = None;
                 self.worker.send(Req::Folders);
             }
@@ -309,7 +438,10 @@ impl App {
                 self.conn = None;
                 self.folders = None;
                 self.scripts.clear();
-                self.doc = None;
+                self.ws = None;
+                self.sel = None;
+                self.server_view = None;
+                self.imported.clear();
                 self.info("Logged out");
             }
             Resp::Scripts { scripts, msg } => {
@@ -319,86 +451,53 @@ impl App {
                 }
             }
             Resp::Loaded { name, content } => {
-                let content = content.replace("\r\n", "\n");
-                let (mode, original, note) = if content.trim().is_empty() {
-                    (DocMode::Rules(Vec::new()), String::new(), None)
-                } else {
-                    match rules::extract(&content) {
-                        Some(Ok(set)) => {
-                            let orig = rules::compile(&set).unwrap_or_else(|_| content.clone());
-                            (DocMode::Rules(set.rules.iter().map(UiRule::from_rule).collect()), orig, None)
-                        }
-                        Some(Err(e)) => (
-                            DocMode::Raw(content.clone()),
-                            content.clone(),
-                            Some(format!("Embedded rules couldn't be read ({e:#}); showing the raw script.")),
-                        ),
-                        None => (
-                            DocMode::Raw(content.clone()),
-                            content.clone(),
-                            Some("This script wasn't made with the rule builder, so it opens as raw Sieve.".into()),
-                        ),
-                    }
-                };
-                self.tab = if matches!(mode, DocMode::Rules(_)) {
-                    Tab::Rules
-                } else {
-                    Tab::Sieve
-                };
-                self.sel = match &mode {
-                    DocMode::Rules(r) if !r.is_empty() => Some(0),
-                    _ => None,
-                };
-                self.doc = Some(Doc {
-                    name,
-                    original,
-                    mode,
-                    on_server: true,
-                    note,
-                });
-                self.check = None;
-                self.status = None;
-            }
-            Resp::Checked(r) => {
-                match &r {
-                    Ok(_) => self.info("The server accepted the script"),
-                    Err(_) => self.error("The server rejected the script"),
+                if self.viewing.as_deref() == Some(name.as_str()) {
+                    self.viewing = None;
+                    self.server_view = Some((name, content.replace("\r\n", "\n")));
+                    self.tab = Tab::Server;
+                } else if name == SCRIPT_NAME {
+                    let ws = Workspace::from_script(&content);
+                    self.sel = match ws.groups.first() {
+                        Some(g) if !g.rules.is_empty() => Some(Sel::Rule(0, 0)),
+                        Some(_) => Some(Sel::Group(0)),
+                        None => None,
+                    };
+                    self.ws = Some(ws);
+                    self.tab = Tab::Rules;
+                    self.check = None;
+                    self.status = None;
                 }
-                self.check = Some(r);
             }
+            Resp::LoadedMany(list) => self.import(list),
+            Resp::Checked(r) => self.check = Some(r),
             Resp::Saved {
                 name,
                 warnings,
                 scripts,
             } => {
                 self.scripts = scripts;
-                if let (Some(doc), Some((sname, script))) = (&mut self.doc, self.saving.take()) {
-                    if doc.name == name && sname == name {
-                        doc.original = script;
-                        doc.on_server = true;
-                    }
+                if name != SCRIPT_NAME {
+                    return;
+                }
+                if let (Some(ws), Some(script)) = (&mut self.ws, self.saving.take()) {
+                    ws.original = script;
+                    ws.on_server = true;
+                    ws.note = None;
                 }
                 self.check = warnings.clone().map(|w| Ok(Some(w)));
-                self.info(format!(
-                    "Saved {name}{}",
-                    if self.is_active(&name) {
-                        " (active)"
-                    } else {
-                        ""
-                    }
-                ));
+                self.info("Saved. Your rules are live.");
+                if !self.imported.is_empty() {
+                    self.modal = Some(Modal::DeleteOld(std::mem::take(&mut self.imported)));
+                    return;
+                }
                 // Rules ticked "apply to the Inbox when I save".
                 let mut run = Vec::new();
-                if let Some(Doc {
-                    name: dn,
-                    mode: DocMode::Rules(rs),
-                    ..
-                }) = &mut self.doc
-                {
-                    if *dn == name {
-                        for r in rs.iter_mut().filter(|r| r.run_now) {
+                if let Some(ws) = &mut self.ws {
+                    for g in &mut ws.groups {
+                        let live = g.enabled;
+                        for r in g.rules.iter_mut().filter(|r| r.run_now) {
                             r.run_now = false;
-                            if let (true, Ok(rule)) = (r.enabled, r.to_rule()) {
+                            if let (true, true, Ok(rule)) = (live, r.enabled, r.to_rule()) {
                                 run.push(rule);
                             }
                         }
@@ -414,19 +513,11 @@ impl App {
             }
             Resp::Deleted { name, scripts } => {
                 self.scripts = scripts;
-                if self.doc.as_ref().is_some_and(|d| d.name == name) {
-                    self.doc = None;
+                if self.server_view.as_ref().is_some_and(|(n, _)| *n == name) {
+                    self.server_view = None;
+                    self.tab = Tab::Rules;
                 }
                 self.info(format!("Deleted {name}"));
-            }
-            Resp::Renamed { old, new, scripts } => {
-                self.scripts = scripts;
-                if let Some(d) = &mut self.doc {
-                    if d.name == old {
-                        d.name = new.clone();
-                    }
-                }
-                self.info(format!("Renamed {old} to {new}"));
             }
             Resp::Folders(r) => self.folders = Some(r),
             Resp::InboxPreview(r) => {
@@ -463,6 +554,7 @@ impl App {
                 self.connecting = false;
                 self.auto_connecting = false;
                 self.saving = None;
+                self.viewing = None;
                 self.error(e);
             }
         }
@@ -590,7 +682,7 @@ impl App {
         });
     }
 
-    fn scripts_panel(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
+    fn sidebar(&mut self, ui: &mut egui::Ui, ctx: &egui::Context) {
         if let Some(c) = &self.conn {
             ui.add_space(6.0);
             ui.label(RichText::new(&c.label).strong());
@@ -606,122 +698,261 @@ impl App {
             self.guard(After::LogOut, ctx);
         }
         ui.separator();
+
+        let mut edit: Option<Edit> = None;
         ui.horizontal(|ui| {
-            ui.heading("Scripts");
+            ui.heading("Groups");
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if ui.button("➕").on_hover_text("New script").clicked() {
-                    self.guard(After::NewScript, ctx);
-                }
-                if ui.button("🔄").on_hover_text("Refresh").clicked() {
-                    self.worker.send(Req::List);
+                if ui.button("➕").on_hover_text("New group").clicked() {
+                    edit = Some(Edit::AddGroup);
                 }
             });
         });
         ui.add_space(4.0);
-        let open = self.doc.as_ref().map(|d| d.name.clone());
-        let mut todo: Option<(u8, String)> = None;
-        ScrollArea::vertical()
-            .auto_shrink([false, true])
+
+        // Advanced pane takes the bottom; the group tree scrolls above it.
+        let advanced = self.s.advanced;
+        let mut open_script: Option<String> = None;
+        let mut refresh = false;
+        egui::Panel::bottom("advanced")
+            .resizable(false)
             .show(ui, |ui| {
-                ui.with_layout(Layout::top_down_justified(Align::Min), |ui| {
-                    for (name, active) in self.scripts.clone() {
-                        let text = if active {
+                ui.add_space(4.0);
+                ui.checkbox(&mut self.s.advanced, "Advanced")
+                    .on_hover_text("Show the raw scripts on the server, for debugging");
+                if advanced {
+                    ui.horizontal(|ui| {
+                        ui.label(RichText::new("Server scripts").strong());
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            refresh = ui.small_button("🔄").on_hover_text("Refresh").clicked();
+                        });
+                    });
+                    let open = self.server_view.as_ref().map(|(n, _)| n.as_str());
+                    for (name, active) in &self.scripts {
+                        let text = if *active {
                             RichText::new(format!("★ {name}")).strong()
                         } else {
                             RichText::new(format!("    {name}"))
                         };
-                        let r = ui.selectable_label(open.as_deref() == Some(&name), text);
-                        if r.clicked() && open.as_deref() != Some(&name) {
-                            todo = Some((0, name.clone()));
+                        if ui
+                            .selectable_label(open == Some(name.as_str()), text)
+                            .on_hover_text("Open read-only")
+                            .clicked()
+                        {
+                            open_script = Some(name.clone());
                         }
-                        r.context_menu(|ui| {
-                            if ui.button("Open").clicked() {
-                                todo = Some((0, name.clone()));
-                                ui.close();
+                    }
+                    ui.label(RichText::new("★ = active. Read-only view.").weak().small());
+                }
+                ui.add_space(4.0);
+            });
+        if refresh {
+            self.worker.send(Req::List);
+        }
+        if let Some(n) = open_script {
+            self.viewing = Some(n.clone());
+            self.worker.send(Req::Get(n));
+        }
+
+        let Some(ws) = &mut self.ws else {
+            return;
+        };
+        let sel = &mut self.sel;
+        ScrollArea::vertical()
+            .auto_shrink([false, false])
+            .show(ui, |ui| {
+                let ng = ws.groups.len();
+                for (gi, g) in ws.groups.iter_mut().enumerate() {
+                    ui.horizontal(|ui| {
+                        let arrow = if g.collapsed { "▶" } else { "▼" };
+                        if ui.small_button(arrow).on_hover_text("Show/hide rules").clicked() {
+                            g.collapsed = !g.collapsed;
+                        }
+                        ui.checkbox(&mut g.enabled, "")
+                            .on_hover_text("Enable or disable the whole group");
+                        let mut t = RichText::new(if g.name.trim().is_empty() {
+                            "(unnamed)"
+                        } else {
+                            g.name.as_str()
+                        })
+                        .strong();
+                        if !g.enabled {
+                            t = t.weak().strikethrough();
+                        }
+                        if ui.selectable_label(*sel == Some(Sel::Group(gi)), t).clicked() {
+                            *sel = Some(Sel::Group(gi));
+                        }
+                        ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                            if ui
+                                .add_enabled(gi + 1 < ng, egui::Button::new("⬇").small())
+                                .on_hover_text("Move group down")
+                                .clicked()
+                            {
+                                edit = Some(Edit::MoveGroup(gi, 1));
                             }
-                            if active {
-                                if ui.button("Deactivate").clicked() {
-                                    todo = Some((1, String::new()));
-                                    ui.close();
-                                }
-                            } else if ui.button("Make active").clicked() {
-                                todo = Some((1, name.clone()));
-                                ui.close();
-                            }
-                            if ui.button("Rename…").clicked() {
-                                todo = Some((2, name.clone()));
-                                ui.close();
-                            }
-                            if ui.button("Delete…").clicked() {
-                                todo = Some((3, name.clone()));
-                                ui.close();
+                            if ui
+                                .add_enabled(gi > 0, egui::Button::new("⬆").small())
+                                .on_hover_text("Move group up")
+                                .clicked()
+                            {
+                                edit = Some(Edit::MoveGroup(gi, -1));
                             }
                         });
+                    });
+                    if g.collapsed {
+                        continue;
                     }
-                    if self.scripts.is_empty() {
-                        ui.label(RichText::new("No scripts on the server yet.").weak());
-                    }
-                });
+                    let nr = g.rules.len();
+                    ui.indent(("group", gi), |ui| {
+                        for (ri, r) in g.rules.iter_mut().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.checkbox(&mut r.enabled, "").on_hover_text("Enabled");
+                                let name = if r.name.trim().is_empty() {
+                                    "(unnamed)".to_string()
+                                } else if r.raw.is_some() {
+                                    format!("⌨ {}", r.name)
+                                } else {
+                                    r.name.clone()
+                                };
+                                let mut t = RichText::new(name);
+                                if !r.enabled || !g.enabled {
+                                    t = t.weak();
+                                }
+                                if !r.enabled {
+                                    t = t.strikethrough();
+                                }
+                                if ui
+                                    .selectable_label(*sel == Some(Sel::Rule(gi, ri)), t)
+                                    .clicked()
+                                {
+                                    *sel = Some(Sel::Rule(gi, ri));
+                                }
+                                ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
+                                    if ui.small_button("🗑").on_hover_text("Delete rule").clicked() {
+                                        edit = Some(Edit::DeleteRule(gi, ri));
+                                    }
+                                    if ui
+                                        .add_enabled(ri + 1 < nr, egui::Button::new("⬇").small())
+                                        .clicked()
+                                    {
+                                        edit = Some(Edit::MoveRule(gi, ri, 1));
+                                    }
+                                    if ui
+                                        .add_enabled(ri > 0, egui::Button::new("⬆").small())
+                                        .clicked()
+                                    {
+                                        edit = Some(Edit::MoveRule(gi, ri, -1));
+                                    }
+                                });
+                            });
+                        }
+                        ui.horizontal(|ui| {
+                            if ui.small_button("➕ Rule").clicked() {
+                                edit = Some(Edit::AddRule(gi, false));
+                            }
+                            if ui
+                                .small_button("➕ Raw Sieve")
+                                .on_hover_text("A block of hand-written Sieve, inserted as-is")
+                                .clicked()
+                            {
+                                edit = Some(Edit::AddRule(gi, true));
+                            }
+                        });
+                    });
+                    ui.add_space(4.0);
+                }
+                if ws.groups.is_empty() {
+                    ui.label(RichText::new("No groups yet. Add one with ➕.").weak());
+                }
+                ui.add_space(6.0);
+                ui.label(
+                    RichText::new("Groups and rules run top to bottom.")
+                        .weak()
+                        .small(),
+                );
             });
-        ui.add_space(6.0);
-        ui.label(RichText::new("★ marks the active script; only one runs at a time. Right-click a script for more.").weak().small());
-        match todo {
-            Some((0, n)) => self.guard(After::Open(n), ctx),
-            Some((1, n)) => self.worker.send(Req::Activate(n)),
-            Some((2, n)) => {
-                self.modal = Some(Modal::Rename {
-                    new: n.clone(),
-                    old: n,
-                })
+
+        match edit {
+            Some(Edit::AddGroup) => {
+                let name = ws.unique_name("New group");
+                ws.groups.push(UiGroup::new(name));
+                *sel = Some(Sel::Group(ws.groups.len() - 1));
             }
-            Some((3, n)) => self.modal = Some(Modal::Delete(n)),
-            _ => {}
+            Some(Edit::MoveGroup(gi, d)) => {
+                let gj = (gi as isize + d) as usize;
+                ws.groups.swap(gi, gj);
+                *sel = sel.map(|s| match s {
+                    Sel::Group(x) if x == gi => Sel::Group(gj),
+                    Sel::Group(x) if x == gj => Sel::Group(gi),
+                    Sel::Rule(x, r) if x == gi => Sel::Rule(gj, r),
+                    Sel::Rule(x, r) if x == gj => Sel::Rule(gi, r),
+                    s => s,
+                });
+            }
+            Some(Edit::AddRule(gi, raw)) => {
+                let g = &mut ws.groups[gi];
+                let n = g.rules.len() + 1;
+                g.rules.push(if raw { UiRule::new_raw(n) } else { UiRule::new(n) });
+                g.collapsed = false;
+                *sel = Some(Sel::Rule(gi, g.rules.len() - 1));
+            }
+            Some(Edit::MoveRule(gi, ri, d)) => {
+                let rj = (ri as isize + d) as usize;
+                ws.groups[gi].rules.swap(ri, rj);
+                if *sel == Some(Sel::Rule(gi, ri)) {
+                    *sel = Some(Sel::Rule(gi, rj));
+                } else if *sel == Some(Sel::Rule(gi, rj)) {
+                    *sel = Some(Sel::Rule(gi, ri));
+                }
+            }
+            Some(Edit::DeleteRule(gi, ri)) => {
+                ws.groups[gi].rules.remove(ri);
+                if matches!(*sel, Some(Sel::Rule(g, _)) if g == gi) {
+                    *sel = Some(Sel::Group(gi));
+                }
+            }
+            None => {}
         }
     }
 
-    fn doc_view(&mut self, ui: &mut egui::Ui) {
-        let Some(doc) = &self.doc else {
+    fn main_view(&mut self, ui: &mut egui::Ui) {
+        let Some(ws) = &self.ws else {
             ui.centered_and_justified(|ui| {
-                ui.label(
-                    RichText::new("Pick a script on the left, or create a new one with ➕.").weak(),
-                );
+                ui.horizontal(|ui| {
+                    ui.spinner();
+                    ui.label("Loading your rules…");
+                });
             });
             return;
         };
-        let name = doc.name.clone();
-        let dirty = doc.dirty();
-        let is_rules = matches!(doc.mode, DocMode::Rules(_));
-        let active = self.is_active(&name);
-        let compiled = doc.compiled();
-        let note = doc.note.clone();
-        let on_server = doc.on_server;
+        let dirty = ws.dirty();
+        let on_server = ws.on_server;
+        let compiled = ws.compiled();
+        let note = ws.note.clone();
+        let active = self.active_script().map(str::to_string);
+        let live = on_server && active.as_deref() == Some(SCRIPT_NAME);
 
         // toolbar
         let mut act: Option<&str> = None;
         ui.horizontal(|ui| {
-            ui.heading(&name);
-            if active {
-                ui.label(RichText::new("★ active").color(Color32::from_rgb(0xd9, 0xa4, 0x1e)));
-            }
+            ui.heading("Your rules");
             if dirty {
                 ui.label(RichText::new("• unsaved").color(ui.visuals().warn_fg_color));
+            } else if live {
+                ui.label(RichText::new("● live").color(Color32::from_rgb(0x3f, 0xa3, 0x4d)))
+                    .on_hover_text(format!("Saved and active on the server as “{SCRIPT_NAME}”"));
             }
             ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                if is_rules {
-                    ui.menu_button("More…", |ui| {
-                        if ui.button("Convert to raw Sieve…").clicked() {
-                            act = Some("raw");
-                            ui.close();
-                        }
-                    });
-                }
-                if !active && ui.button("Save & activate").clicked() {
-                    act = Some("save_act");
-                }
+                ui.menu_button("More…", |ui| {
+                    if ui.button("Import server scripts…").clicked() {
+                        act = Some("import");
+                        ui.close();
+                    }
+                });
                 let save = ui.add_enabled(dirty, egui::Button::new("💾 Save"));
                 if save
                     .on_hover_text(format!(
-                        "Validate and upload ({})",
+                        "Validate, upload and activate “{SCRIPT_NAME}” ({})",
                         ui.ctx().format_shortcut(&SAVE)
                     ))
                     .clicked()
@@ -741,15 +972,41 @@ impl App {
             });
         });
         match act {
-            Some("save") => self.save(false),
-            Some("save_act") => self.save(true),
+            Some("save") => self.save(),
             Some("check") => self.check(),
-            Some("revert") => self.worker.send(Req::Get(name.clone())),
-            Some("raw") => self.modal = Some(Modal::ToRaw),
+            Some("revert") => self.worker.send(Req::Get(SCRIPT_NAME.into())),
+            Some("import") => {
+                let items = self.import_items();
+                if items.is_empty() {
+                    self.info("There are no other scripts on the server.");
+                } else {
+                    self.modal = Some(Modal::Import(items));
+                }
+            }
             _ => {}
         }
 
         // banners
+        if on_server && !live {
+            let text = match &active {
+                Some(n) => format!("Another app activated “{n}”. Your rules aren't running."),
+                None => "No script is active on the server. Your rules aren't running.".into(),
+            };
+            egui::Frame::group(ui.style())
+                .fill(ui.visuals().warn_fg_color.gamma_multiply(0.12))
+                .show(ui, |ui| {
+                    ui.horizontal(|ui| {
+                        ui.colored_label(ui.visuals().warn_fg_color, format!("⚠ {text}"));
+                        if ui
+                            .button("Take over")
+                            .on_hover_text(format!("Make “{SCRIPT_NAME}” the active script again"))
+                            .clicked()
+                        {
+                            self.worker.send(Req::Activate(SCRIPT_NAME.into()));
+                        }
+                    });
+                });
+        }
         if let Some(n) = note {
             ui.colored_label(ui.visuals().warn_fg_color, n);
         }
@@ -799,142 +1056,207 @@ impl App {
             self.check = None;
         }
 
+        let mut close_server = false;
         ui.horizontal(|ui| {
-            if is_rules {
-                ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
-                ui.selectable_value(&mut self.tab, Tab::Sieve, "Generated Sieve");
-            } else {
-                ui.selectable_value(&mut self.tab, Tab::Sieve, "Sieve script");
-                self.tab = Tab::Sieve;
+            ui.selectable_value(&mut self.tab, Tab::Rules, "Rules");
+            ui.selectable_value(&mut self.tab, Tab::Sieve, "Generated Sieve");
+            if let Some((n, _)) = &self.server_view {
+                ui.selectable_value(&mut self.tab, Tab::Server, format!("Server: {n}"));
+                close_server = ui.small_button("✖").on_hover_text("Close").clicked();
             }
         });
+        if close_server {
+            self.server_view = None;
+            if self.tab == Tab::Server {
+                self.tab = Tab::Rules;
+            }
+        }
         ui.separator();
 
-        if self.tab == Tab::Rules && is_rules {
-            self.rules_view(ui);
-        } else {
-            self.sieve_view(ui, compiled);
-        }
-    }
-
-    fn sieve_view(&mut self, ui: &mut egui::Ui, compiled: anyhow::Result<String>) {
-        let Some(doc) = &mut self.doc else { return };
-        match &mut doc.mode {
-            DocMode::Raw(text) => {
-                ScrollArea::vertical()
-                    .auto_shrink([false, false])
-                    .show(ui, |ui| {
-                        ui.add(
-                            TextEdit::multiline(text)
-                                .code_editor()
-                                .desired_rows(30)
-                                .desired_width(f32::INFINITY),
-                        );
+        match self.tab {
+            Tab::Rules => self.rules_view(ui),
+            Tab::Sieve => read_only_code(
+                ui,
+                compiled.map_err(|e| format!("{e:#}")),
+                "Read-only: the whole script, generated from all groups. The #@ block at the end stores the groups and rules so they can be reopened.",
+            ),
+            Tab::Server => match &self.server_view {
+                Some((n, text)) => read_only_code(
+                    ui,
+                    Ok(text.clone()),
+                    &format!("Read-only copy of “{n}” as stored on the server."),
+                ),
+                None => {
+                    ui.horizontal(|ui| {
+                        ui.spinner();
+                        ui.label("Loading…");
                     });
-            }
-            DocMode::Rules(_) => match compiled {
-                Ok(s) => {
-                    ui.label(
-                        RichText::new("Read-only: generated from your rules. The #@ block at the end stores the rules so they can be reopened.")
-                            .weak()
-                            .small(),
-                    );
-                    ScrollArea::vertical()
-                        .auto_shrink([false, false])
-                        .show(ui, |ui| {
-                            ui.add(
-                                TextEdit::multiline(&mut s.as_str())
-                                    .code_editor()
-                                    .desired_width(f32::INFINITY),
-                            );
-                        });
-                }
-                Err(e) => {
-                    ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e:#}"));
                 }
             },
         }
     }
 
     fn rules_view(&mut self, ui: &mut egui::Ui) {
-        let Some(Doc {
-            mode: DocMode::Rules(rules),
-            ..
-        }) = &mut self.doc
-        else {
-            return;
+        let Some(ws) = &mut self.ws else { return };
+        // Drop a selection that no longer exists.
+        self.sel = match self.sel {
+            Some(Sel::Rule(g, r)) if ws.groups.get(g).is_some_and(|x| r < x.rules.len()) => {
+                Some(Sel::Rule(g, r))
+            }
+            Some(Sel::Rule(g, _)) | Some(Sel::Group(g)) if g < ws.groups.len() => {
+                Some(Sel::Group(g))
+            }
+            _ => None,
         };
-        let sel = &mut self.sel;
         let folders = self.folders.as_ref();
         let mut reload = false;
         let mut run = false;
-        if sel.is_some_and(|i| i >= rules.len()) {
-            *sel = rules.len().checked_sub(1);
-        }
+        let mut move_to: Option<usize> = None;
+        let mut delete_group = false;
+        let group_names: Vec<String> = ws.groups.iter().map(|g| g.name.clone()).collect();
 
-        egui::Panel::left("rule_list")
-            .resizable(true)
-            .default_size(250.0)
-            .show(ui, |ui| {
-                rule_list(ui, rules, sel);
-            });
-
-        let preview = sel.and_then(|i| rules.get(i)).map(|r| {
-            r.to_rule()
-                .and_then(|r| rules::compile_rule(&r, &mut Default::default()))
-        });
-        egui::Panel::bottom("rule_preview")
-            .resizable(true)
-            .default_size(180.0)
-            .show(ui, |ui| {
-                ui.add_space(4.0);
-                ui.label(RichText::new("Sieve for this rule").strong());
-                match preview {
-                    Some(Ok(s)) => {
-                        ScrollArea::vertical()
-                            .auto_shrink([false, false])
-                            .show(ui, |ui| {
-                                ui.add(
-                                    TextEdit::multiline(&mut s.as_str())
-                                        .code_editor()
-                                        .desired_width(f32::INFINITY),
-                                );
-                            });
-                    }
-                    Some(Err(e)) => {
-                        ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e:#}"));
-                    }
-                    None => {
-                        ui.label(RichText::new("Select a rule").weak());
-                    }
+        match self.sel {
+            Some(Sel::Rule(gi, ri)) => {
+                let rule = &mut ws.groups[gi].rules[ri];
+                if rule.raw.is_none() {
+                    let preview = rule
+                        .to_rule()
+                        .and_then(|r| rules::compile_rule(&r, &mut Default::default()));
+                    egui::Panel::bottom("rule_preview")
+                        .resizable(true)
+                        .default_size(180.0)
+                        .show(ui, |ui| {
+                            ui.add_space(4.0);
+                            ui.label(RichText::new("Sieve for this rule").strong());
+                            match preview {
+                                Ok(s) => {
+                                    ScrollArea::vertical()
+                                        .auto_shrink([false, false])
+                                        .show(ui, |ui| {
+                                            ui.add(
+                                                TextEdit::multiline(&mut s.as_str())
+                                                    .code_editor()
+                                                    .desired_width(f32::INFINITY),
+                                            );
+                                        });
+                                }
+                                Err(e) => {
+                                    ui.colored_label(
+                                        ui.visuals().error_fg_color,
+                                        format!("⚠ {e:#}"),
+                                    );
+                                }
+                            }
+                        });
                 }
-            });
-
-        egui::CentralPanel::default().show(ui, |ui| match sel {
-            Some(i) if *i < rules.len() => {
-                let i = *i;
                 ScrollArea::vertical()
                     .auto_shrink([false, false])
                     .show(ui, |ui| {
-                        rule_editor(ui, &mut rules[i], i, folders, &mut reload, &mut run)
+                        ui.horizontal(|ui| {
+                            ui.label("Group");
+                            let mut target = gi;
+                            ComboBox::from_id_salt(("rule_group", gi, ri))
+                                .selected_text(group_names[gi].as_str())
+                                .show_ui(ui, |ui| {
+                                    for (i, n) in group_names.iter().enumerate() {
+                                        ui.selectable_value(&mut target, i, n.as_str());
+                                    }
+                                });
+                            if target != gi {
+                                move_to = Some(target);
+                            }
+                        });
+                        let uid = gi * 1000 + ri;
+                        if rule.raw.is_some() {
+                            raw_editor(ui, rule);
+                        } else {
+                            rule_editor(ui, rule, uid, folders, &mut reload, &mut run);
+                        }
                     });
             }
-            _ => {
+            Some(Sel::Group(gi)) => {
+                let g = &mut ws.groups[gi];
+                ScrollArea::vertical()
+                    .auto_shrink([false, false])
+                    .show(ui, |ui| {
+                        ui.add_space(6.0);
+                        ui.horizontal(|ui| {
+                            ui.label("Group name");
+                            ui.add(TextEdit::singleline(&mut g.name).desired_width(320.0));
+                            ui.checkbox(&mut g.enabled, "Enabled");
+                        });
+                        ui.add_space(6.0);
+                        ui.label(
+                            RichText::new(format!(
+                                "{} rule{}. {}",
+                                g.rules.len(),
+                                if g.rules.len() == 1 { "" } else { "s" },
+                                if g.enabled {
+                                    "Its rules run in order, after the groups above it."
+                                } else {
+                                    "Disabled: none of its rules are in the script."
+                                }
+                            ))
+                            .weak(),
+                        );
+                        ui.add_space(10.0);
+                        ui.horizontal(|ui| {
+                            if ui.button("➕ Add rule").clicked() {
+                                g.rules.push(UiRule::new(g.rules.len() + 1));
+                                g.collapsed = false;
+                                self.sel = Some(Sel::Rule(gi, g.rules.len() - 1));
+                            }
+                            if ui.button("➕ Add raw Sieve").clicked() {
+                                g.rules.push(UiRule::new_raw(g.rules.len() + 1));
+                                g.collapsed = false;
+                                self.sel = Some(Sel::Rule(gi, g.rules.len() - 1));
+                            }
+                        });
+                        ui.add_space(16.0);
+                        if ui
+                            .button(
+                                RichText::new("🗑 Delete group…")
+                                    .color(ui.visuals().error_fg_color),
+                            )
+                            .clicked()
+                        {
+                            delete_group = true;
+                        }
+                    });
+                if delete_group {
+                    self.modal = Some(Modal::DeleteGroup(gi));
+                }
+            }
+            None => {
                 ui.centered_and_justified(|ui| {
-                    ui.label(RichText::new("No rule selected. Add one with “➕ Add rule”.").weak());
+                    ui.label(
+                        RichText::new(if ws.groups.is_empty() {
+                            "Add a group with ➕ on the left, then add rules to it."
+                        } else {
+                            "Select a group or rule on the left."
+                        })
+                        .weak(),
+                    );
                 });
             }
-        });
+        }
+
+        if let (Some(target), Some(Sel::Rule(gi, ri))) = (move_to, self.sel) {
+            let r = ws.groups[gi].rules.remove(ri);
+            ws.groups[target].rules.push(r);
+            ws.groups[target].collapsed = false;
+            self.sel = Some(Sel::Rule(target, ws.groups[target].rules.len() - 1));
+        }
         if reload {
             self.folders = None;
             self.worker.send(Req::Folders);
         }
         if run {
-            let picked = match &self.doc {
-                Some(Doc {
-                    mode: DocMode::Rules(rs),
-                    ..
-                }) => self.sel.and_then(|i| rs.get(i)).map(|r| (r.name.clone(), r.to_rule())),
+            let picked = match (self.sel, &self.ws) {
+                (Some(Sel::Rule(gi, ri)), Some(ws)) => ws.groups[gi]
+                    .rules
+                    .get(ri)
+                    .map(|r| (r.name.clone(), r.to_rule())),
                 _ => None,
             };
             match picked {
@@ -976,91 +1298,113 @@ impl App {
         };
         let mut keep = true;
         let mut then: Option<After> = None;
-        let names: Vec<String> = self.scripts.iter().map(|(n, _)| n.clone()).collect();
         let resp = egui::Modal::new(egui::Id::new("modal")).show(ctx, |ui| {
             ui.set_width(380.0);
             match &mut m {
-                Modal::NewScript { name, raw } => {
-                    ui.heading("New script");
-                    ui.add_space(6.0);
-                    let r = ui.add(TextEdit::singleline(name).hint_text("Script name, e.g. filters").desired_width(f32::INFINITY));
-                    r.request_focus();
-                    ui.radio_value(raw, false, "Build with rules (recommended)");
-                    ui.radio_value(raw, true, "Blank Sieve script (hand-written)");
-                    let n = name.trim().to_string();
-                    let exists = names.contains(&n);
-                    if exists {
-                        ui.colored_label(ui.visuals().error_fg_color, "A script with that name exists.");
-                    }
-                    ui.add_space(8.0);
-                    ui.horizontal(|ui| {
-                        let ok = !n.is_empty() && !exists;
-                        if ui.add_enabled(ok, egui::Button::new("Create")).clicked()
-                            || (ok && ui.input(|i| i.key_pressed(Key::Enter)))
-                        {
-                            let mode = if *raw {
-                                DocMode::Raw("require [\"fileinto\"];\n\n".into())
-                            } else {
-                                DocMode::Rules(vec![UiRule::new(1)])
-                            };
-                            self.sel = if *raw { None } else { Some(0) };
-                            self.tab = if *raw { Tab::Sieve } else { Tab::Rules };
-                            self.doc = Some(Doc { name: n, original: String::new(), mode, on_server: false, note: None });
-                            self.check = None;
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
-                Modal::Rename { old, new } => {
-                    ui.heading(format!("Rename “{old}”"));
-                    ui.add(TextEdit::singleline(new).desired_width(f32::INFINITY));
-                    let n = new.trim().to_string();
-                    let ok = !n.is_empty() && n != *old && !names.contains(&n);
-                    ui.horizontal(|ui| {
-                        if ui.add_enabled(ok, egui::Button::new("Rename")).clicked() {
-                            self.worker.send(Req::Rename(old.clone(), n));
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
-                Modal::Delete(name) => {
-                    ui.heading(format!("Delete “{name}”?"));
-                    ui.label("The script is removed from the server. This can't be undone.");
-                    let active = self.scripts.iter().any(|(n, a)| n == name && *a);
-                    if active {
-                        ui.colored_label(
-                            ui.visuals().warn_fg_color,
-                            "This is the active script. It will be deactivated first, so no filtering runs until you activate another.",
-                        );
-                    }
-                    ui.horizontal(|ui| {
-                        if ui.button(RichText::new("Delete").color(ui.visuals().error_fg_color)).clicked() {
-                            if active {
-                                self.worker.send(Req::Activate(String::new()));
-                            }
-                            self.worker.send(Req::Delete(name.clone()));
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
                 Modal::Discard(a) => {
                     ui.heading("Unsaved changes");
-                    ui.label(format!(
-                        "“{}” has changes that aren't on the server yet. Discard them?",
-                        self.doc.as_ref().map(|d| d.name.as_str()).unwrap_or("")
-                    ));
+                    ui.label("Your rules have changes that aren't on the server yet. Discard them?");
                     ui.horizontal(|ui| {
                         if ui.button("Discard").clicked() {
                             then = Some(a.clone());
+                            keep = false;
+                        }
+                        if ui.button("Cancel").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Modal::Import(items) => {
+                    ui.set_width(460.0);
+                    ui.heading("Bring in your existing filters?");
+                    ui.add_space(4.0);
+                    ui.label(format!(
+                        "Vera Colander keeps all your rules in one script, “{SCRIPT_NAME}”, and keeps it active. These scripts are on the server now. Import them as groups:"
+                    ));
+                    ui.add_space(6.0);
+                    for it in items.iter_mut() {
+                        let label = if it.active {
+                            format!("{} (active)", it.name)
+                        } else {
+                            it.name.clone()
+                        };
+                        ui.checkbox(&mut it.pick, label);
+                    }
+                    ui.add_space(6.0);
+                    ui.label(
+                        RichText::new("Only the active script was running, so the others come in as disabled groups. Nothing changes on the server until you Save.")
+                            .weak()
+                            .small(),
+                    );
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        let any = items.iter().any(|i| i.pick);
+                        if ui.add_enabled(any, egui::Button::new("Import")).clicked() {
+                            // Active script first: it's the one that was running.
+                            let mut names: Vec<(bool, String)> = items
+                                .iter()
+                                .filter(|i| i.pick)
+                                .map(|i| (!i.active, i.name.clone()))
+                                .collect();
+                            names.sort_by_key(|(inactive, _)| *inactive);
+                            self.worker
+                                .send(Req::GetMany(names.into_iter().map(|(_, n)| n).collect()));
+                            keep = false;
+                        }
+                        if ui.button("Start fresh").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Modal::DeleteOld(names) => {
+                    ui.set_width(440.0);
+                    ui.heading("Delete the old scripts?");
+                    ui.label(format!(
+                        "Your rules are now saved in “{SCRIPT_NAME}”, which is the active script. These old scripts aren't used any more:"
+                    ));
+                    for n in names.iter() {
+                        ui.label(format!("  • {n}"));
+                    }
+                    ui.add_space(8.0);
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Delete them").color(ui.visuals().error_fg_color))
+                            .clicked()
+                        {
+                            for n in names.iter() {
+                                self.worker.send(Req::Delete(n.clone()));
+                            }
+                            keep = false;
+                        }
+                        if ui.button("Keep them").clicked() {
+                            keep = false;
+                        }
+                    });
+                }
+                Modal::DeleteGroup(gi) => {
+                    let gi = *gi;
+                    let (name, n) = self
+                        .ws
+                        .as_ref()
+                        .and_then(|w| w.groups.get(gi))
+                        .map(|g| (g.name.clone(), g.rules.len()))
+                        .unwrap_or_default();
+                    ui.heading(format!("Delete group “{name}”?"));
+                    ui.label(format!(
+                        "The group and its {n} rule{} are removed when you next Save.",
+                        if n == 1 { "" } else { "s" }
+                    ));
+                    ui.horizontal(|ui| {
+                        if ui
+                            .button(RichText::new("Delete").color(ui.visuals().error_fg_color))
+                            .clicked()
+                        {
+                            if let Some(ws) = &mut self.ws {
+                                if gi < ws.groups.len() {
+                                    ws.groups.remove(gi);
+                                }
+                            }
+                            self.sel = None;
                             keep = false;
                         }
                         if ui.button("Cancel").clicked() {
@@ -1147,27 +1491,6 @@ impl App {
                         }
                     }
                 },
-                Modal::ToRaw => {
-                    ui.heading("Convert to raw Sieve?");
-                    ui.label("You'll be able to hand-edit the script, but it can no longer be edited with the rule builder.");
-                    ui.horizontal(|ui| {
-                        if ui.button("Convert").clicked() {
-                            if let Some(doc) = &mut self.doc {
-                                match doc.compiled() {
-                                    Ok(s) => {
-                                        doc.mode = DocMode::Raw(rules::without_embedded(&s));
-                                        self.tab = Tab::Sieve;
-                                    }
-                                    Err(e) => self.status = Some((format!("Fix the rules first: {e:#}"), true)),
-                                }
-                            }
-                            keep = false;
-                        }
-                        if ui.button("Cancel").clicked() {
-                            keep = false;
-                        }
-                    });
-                }
             }
         });
         if resp.should_close() {
@@ -1196,7 +1519,7 @@ impl eframe::App for App {
             && ctx.input_mut(|i| i.consume_shortcut(&SAVE))
             && self.dirty()
         {
-            self.save(false);
+            self.save();
         }
     }
 
@@ -1206,11 +1529,11 @@ impl eframe::App for App {
         if self.conn.is_none() {
             egui::CentralPanel::default().show(ui, |ui| self.connect_view(ui));
         } else {
-            egui::Panel::left("scripts")
+            egui::Panel::left("groups")
                 .resizable(true)
-                .default_size(220.0)
-                .show(ui, |ui| self.scripts_panel(ui, &ctx));
-            egui::CentralPanel::default().show(ui, |ui| self.doc_view(ui));
+                .default_size(260.0)
+                .show(ui, |ui| self.sidebar(ui, &ctx));
+            egui::CentralPanel::default().show(ui, |ui| self.main_view(ui));
         }
         self.modals(&ctx);
     }
@@ -1220,82 +1543,55 @@ impl eframe::App for App {
     }
 }
 
+fn read_only_code(ui: &mut egui::Ui, text: Result<String, String>, hint: &str) {
+    match text {
+        Ok(s) => {
+            ui.label(RichText::new(hint).weak().small());
+            ScrollArea::vertical()
+                .auto_shrink([false, false])
+                .show(ui, |ui| {
+                    ui.add(
+                        TextEdit::multiline(&mut s.as_str())
+                            .code_editor()
+                            .desired_width(f32::INFINITY),
+                    );
+                });
+        }
+        Err(e) => {
+            ui.colored_label(ui.visuals().error_fg_color, format!("⚠ {e}"));
+        }
+    }
+}
+
+/// Editor for a hand-written Sieve block.
+fn raw_editor(ui: &mut egui::Ui, r: &mut UiRule) {
+    ui.add_space(6.0);
+    ui.horizontal(|ui| {
+        ui.label("Name");
+        ui.add(TextEdit::singleline(&mut r.name).desired_width(320.0));
+        ui.checkbox(&mut r.enabled, "Enabled");
+    });
+    section(ui, "Raw Sieve");
+    ui.label(
+        RichText::new("Inserted into the script exactly as written, at this position. Any require lines are moved into the single require at the top.")
+            .weak(),
+    );
+    ui.add_space(4.0);
+    if let Some(text) = &mut r.raw {
+        ui.add(
+            TextEdit::multiline(text)
+                .code_editor()
+                .desired_rows(18)
+                .desired_width(f32::INFINITY),
+        );
+    }
+}
+
 fn tls_label(t: TlsMode) -> &'static str {
     match t {
         TlsMode::Starttls => "STARTTLS (port 4190, standard)",
         TlsMode::Implicit => "TLS from the start",
         TlsMode::None => "None (unencrypted)",
-    }
-}
-
-fn rule_list(ui: &mut egui::Ui, rules: &mut Vec<UiRule>, sel: &mut Option<usize>) {
-    ui.add_space(4.0);
-    if ui.button("➕ Add rule").clicked() {
-        rules.push(UiRule::new(rules.len() + 1));
-        *sel = Some(rules.len() - 1);
-    }
-    ui.add_space(4.0);
-    let mut mv: Option<(usize, isize)> = None;
-    let mut del: Option<usize> = None;
-    let n = rules.len();
-    ScrollArea::vertical()
-        .auto_shrink([false, true])
-        .show(ui, |ui| {
-            for (i, r) in rules.iter_mut().enumerate() {
-                ui.horizontal(|ui| {
-                    ui.checkbox(&mut r.enabled, "").on_hover_text("Enabled");
-                    let mut t = RichText::new(if r.name.trim().is_empty() {
-                        "(unnamed)"
-                    } else {
-                        r.name.as_str()
-                    });
-                    if !r.enabled {
-                        t = t.weak().strikethrough();
-                    }
-                    if ui.selectable_label(*sel == Some(i), t).clicked() {
-                        *sel = Some(i);
-                    }
-                    ui.with_layout(Layout::right_to_left(Align::Center), |ui| {
-                        if ui.small_button("🗑").on_hover_text("Delete rule").clicked() {
-                            del = Some(i);
-                        }
-                        if ui
-                            .add_enabled(i + 1 < n, egui::Button::new("⬇").small())
-                            .clicked()
-                        {
-                            mv = Some((i, 1));
-                        }
-                        if ui
-                            .add_enabled(i > 0, egui::Button::new("⬆").small())
-                            .clicked()
-                        {
-                            mv = Some((i, -1));
-                        }
-                    });
-                });
-            }
-            if rules.is_empty() {
-                ui.label(RichText::new("No rules yet.").weak());
-            }
-        });
-    ui.add_space(6.0);
-    ui.label(RichText::new("Rules run top to bottom.").weak().small());
-    if let Some((i, d)) = mv {
-        let j = (i as isize + d) as usize;
-        rules.swap(i, j);
-        if *sel == Some(i) {
-            *sel = Some(j);
-        } else if *sel == Some(j) {
-            *sel = Some(i);
-        }
-    }
-    if let Some(i) = del {
-        rules.remove(i);
-        *sel = match *sel {
-            Some(s) if s > i => Some(s - 1),
-            Some(s) if s == i => (!rules.is_empty()).then(|| i.min(rules.len() - 1)),
-            s => s,
-        };
     }
 }
 

@@ -20,27 +20,47 @@ cargo run --release --bin sievectl-gui
    Manager or the Linux Secret Service (GNOME Keyring/KWallet). With a saved
    password the app signs in on launch and goes straight to your rules;
    *Log out* disconnects and forgets the saved password.
-2. Scripts on the server are listed on the left (★ = active). The active
-   script opens automatically. Right-click for activate/rename/delete.
+2. You never manage Sieve scripts. The app owns exactly one server script,
+   `vera-colander`, and keeps it active. The sidebar shows **groups** of rules
+   (e.g. Cooking, Kernel Updates, AlmaLinux): collapse them, reorder them with
+   ⬆/⬇, and switch a whole group on or off with its checkbox. Rules inside a
+   group keep their order, *Enabled* and *Stop here*.
 3. Build rules: pick a field (From, From domain, Subject, List-Id, Size, any
    header…), an operator, and values (separate alternatives with `|`). Add
    actions: move to folder, set flags (mark read), forward, discard, reject,
-   auto-reply. The generated Sieve for the selected rule updates live.
-   The 📁 button next to a folder lists your mailboxes (fetched over IMAP on
-   port 993 with the same login); you can also type a name.
-   Filters only run on new mail. To apply a rule to what is already in the
+   auto-reply. The generated Sieve for the selected rule updates live. The
+   📁 button next to a folder lists your mailboxes (fetched over IMAP on port
+   993 with the same login); you can also type a name. *➕ Raw Sieve* adds a
+   block of hand-written Sieve that is inserted verbatim at its position; its
+   `require` lines are moved into the script's single `require`.
+4. **Save** (Ctrl/Cmd+S) compiles every enabled group, top to bottom, into
+   one script with one merged `require`, then runs CHECKSCRIPT, PUTSCRIPT
+   `vera-colander` and SETACTIVE `vera-colander`. **Check** only validates.
+   *Generated Sieve* shows the whole script (read-only).
+5. Filters only run on new mail. To apply a rule to what is already in the
    Inbox, tick *Apply to the Inbox when I save* or click *Run on Inbox now*:
    the app previews the matching messages and what will happen to each, then
    applies it on confirmation (IMAP 993 for move/copy/flags, SMTP submission
-   on 465 for forwards; delete moves to Trash; auto-reply and reject are not
-   applied to old mail).4. **Check** asks the server to validate; **Save** (Ctrl/Cmd+S) validates and
-   uploads; **Save & activate** makes it the running script.
+   on 465 for forwards; delete moves to Trash; auto-reply, reject and raw
+   Sieve blocks are not applied to old mail).
 
-The rule set is stored inside the uploaded script as a `#@` comment block,
-so any machine (GUI or CLI) can reopen it as editable rules. Scripts not made
-by this tool open in a raw Sieve editor with server-side validation.
-Connection settings persist between runs; the password only lives in the
-keychain.
+**First connect.** If the server has other scripts, the app offers to import
+them: scripts made by this app come in with their groups and rules, anything
+else as a group holding one raw Sieve block. Only the active script was
+running, so the others arrive as disabled groups. After the import is saved,
+the app offers to delete the old scripts. *More… → Import server scripts…*
+repeats this later.
+
+**Every connect.** If another program made a different script active, a
+banner says so (“Another app activated … Your rules aren't running.”) with a
+**Take over** button that re-activates `vera-colander`.
+
+**Advanced** (bottom of the sidebar) lists the raw scripts on the server and
+opens them read-only, for debugging.
+
+The groups and rules are stored inside the uploaded script as a `#@` comment
+block, so any machine (GUI or CLI) can reopen them. Connection settings
+persist between runs; the password only lives in the keychain.
 
 Linux build needs: `libxkbcommon-dev libwayland-dev libgl1-mesa-dev`
 (Debian/Ubuntu) or `libxkbcommon-devel wayland-devel mesa-libGL-devel` (Fedora).
@@ -87,11 +107,14 @@ Use `-P name` for another `[profile.name]`.
 ```sh
 sievectl init                    # example rules.toml
 
-sievectl rule add -n "GitHub" \
+sievectl group add Work                    # groups run top to bottom
+sievectl group ls | rm NAME | enable NAME | disable NAME | move NAME 1
+
+sievectl rule add -g Work -n "GitHub" \
   --if "from.domain is github.com" \
   --then "fileinto GitHub" --stop
 
-sievectl rule add -n "Invoices" --create \
+sievectl rule add -g Work -n "Invoices" --create \
   --if "from.domain is acme.com" --if "subject contains invoice|statement" \
   --then "fileinto Finance/Acme" --then read --then stop
 
@@ -99,10 +122,10 @@ sievectl rule add -n "No-reply junk" --any \
   --if "from.localpart is noreply|no-reply" --if "x-spam-flag is YES" \
   --then discard
 
-sievectl rule list | show NAME | disable NAME | enable NAME | move NAME 1 | rm NAME
-sievectl pull filters rules.toml # get rules back from a script on the server
+sievectl rule list [-g GROUP] | show NAME | disable NAME | enable NAME | move NAME 1 | rm NAME
+sievectl pull                    # get the groups back from "vera-colander" into rules.toml
 sievectl compile                 # print the generated Sieve
-sievectl deploy --activate       # CHECKSCRIPT, then PUTSCRIPT (skipped if unchanged), SETACTIVE
+sievectl deploy --activate       # CHECKSCRIPT, PUTSCRIPT "vera-colander" (skipped if unchanged), SETACTIVE
 sievectl deploy --dry-run        # validate on the server only
 ```
 
@@ -115,6 +138,11 @@ sievectl deploy --dry-run        # validate on the server only
 **Actions:** `fileinto F`, `copy F` (fileinto :copy), `redirect ADDR`, `forward ADDR`
 (redirect :copy), `keep`, `discard`, `reject TEXT`, `flag \\Flagged`, `read`,
 `vacation TEXT`, `stop`. `--create` makes missing folders.
+
+`rule add` without `-g` uses a group called "Rules" (created if needed);
+other `rule` commands find the rule in any group, and take `-g` when two
+groups have a rule with the same name. Rules files from before groups load
+as one "Rules" group. A rule with `raw = """…"""` is hand-written Sieve.
 
 The TOML file is the source of truth; `rule` subcommands rewrite it, so
 comments in it are not preserved. Hand-edit it freely between runs. The full
@@ -142,7 +170,16 @@ sievectl --debug ls              # protocol trace (password redacted)
 
 ## Tested
 
-Unit tests plus end-to-end runs against Dovecot 2.3 / Pigeonhole: CLI
-(STARTTLS, auth failure, CHECKSCRIPT errors, deploy, edit, rename,
-delete-active refusal) and GUI (connect, reopen embedded rules, raw edit +
-server validation, unsaved-changes prompt, build and save a rule).
+Unit tests (`cargo test`) cover the compiler (several groups, `require`
+merging and de-duplication, disabled groups, raw blocks with hoisted
+`require`, metadata round-trip, legacy files), IMAP parsing, and Inbox rule
+evaluation. `one_script_migration_end_to_end` imports two existing scripts,
+saves the single `vera-colander` script, checks it is active and reopens
+identically, then deletes the old scripts. It runs against an in-process fake
+server, or against a real one with
+`SIEVE_E2E=host:port:user:pass cargo test one_script_migration` (plain TCP).
+
+End-to-end runs against Dovecot 2.4 / Pigeonhole: CLI (auth failure,
+CHECKSCRIPT errors, grouped deploy with raw blocks, unchanged detection,
+pull round-trip, edit, rename, delete-active refusal). Earlier versions were
+also run against Dovecot 2.3 with the GUI.

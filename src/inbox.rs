@@ -103,6 +103,9 @@ pub fn preview(acct: &Account, rules: &[Rule]) -> Result<Preview> {
 
     let parser = MessageParser::default();
     let mut notes = BTreeSet::new();
+    if rules.iter().any(|r| r.raw.is_some()) {
+        notes.insert("Raw Sieve blocks aren't applied to existing mail.".to_string());
+    }
     let mut create = BTreeSet::new();
     let mut rows = Vec::new();
     let mut msgs = Vec::new();
@@ -509,6 +512,9 @@ impl<'a> CompiledRule<'a> {
     }
 
     fn matches(&self, m: &Msg) -> bool {
+        if self.rule.raw.is_some() {
+            return false; // hand-written Sieve can't be evaluated here
+        }
         if self.conds.is_empty() {
             return true;
         }

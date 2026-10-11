@@ -105,7 +105,7 @@ user = "me@example.com"
 # port = 4190
 # tls = "starttls"            # starttls | implicit | none
 # ca_file = "/path/to/ca.pem" # for a private/self-signed CA
-# script = "sievectl"         # script name used by `deploy`
+# script = "vera-colander"    # script name used by `deploy`
 # rules = "/path/to/rules.toml"
 #
 # Optional: fetch the password from a manager instead of prompting.

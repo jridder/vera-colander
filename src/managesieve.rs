@@ -584,6 +584,169 @@ mod tests {
         port
     }
 
+    /// A tiny stateful ManageSieve server: stores uploads, tracks the active
+    /// script, serves GETSCRIPT/LISTSCRIPTS/DELETESCRIPT from that state.
+    fn stateful_server(initial: Vec<(&'static str, String, bool)>) -> u16 {
+        let l = TcpListener::bind("127.0.0.1:0").unwrap();
+        let port = l.local_addr().unwrap().port();
+        thread::spawn(move || {
+            let mut scripts: Vec<(String, String)> =
+                initial.iter().map(|(n, c, _)| (n.to_string(), c.clone())).collect();
+            let mut active: Option<String> = initial
+                .iter()
+                .find(|(_, _, a)| *a)
+                .map(|(n, _, _)| n.to_string());
+            let (s, _) = l.accept().unwrap();
+            let mut r = BufReader::new(s.try_clone().unwrap());
+            let mut w = s;
+            w.write_all(b"\"IMPLEMENTATION\" \"Fake\"\r\n\"SASL\" \"PLAIN\"\r\n\"SIEVE\" \"fileinto imap4flags mailbox body copy vacation\"\r\nOK\r\n").unwrap();
+            let quoted = |line: &str, n: usize| -> String {
+                line.split('"').nth(1 + 2 * n).unwrap_or("").to_string()
+            };
+            loop {
+                let mut line = String::new();
+                if r.read_line(&mut line).unwrap() == 0 {
+                    break;
+                }
+                let mut lit = String::new();
+                if let Some(pos) = line.find('{') {
+                    let n: usize = line[pos + 1..line.find("+}").unwrap()].parse().unwrap();
+                    let mut buf = vec![0; n + 2];
+                    r.read_exact(&mut buf).unwrap();
+                    lit = String::from_utf8(buf[..n].to_vec()).unwrap();
+                }
+                let cmd = line.split_whitespace().next().unwrap_or("").to_string();
+                let reply = match cmd.as_str() {
+                    "AUTHENTICATE" | "CHECKSCRIPT" => "OK\r\n".to_string(),
+                    "LISTSCRIPTS" => {
+                        let mut o = String::new();
+                        for (n, _) in &scripts {
+                            let a = if active.as_deref() == Some(n) { " ACTIVE" } else { "" };
+                            o.push_str(&format!("\"{n}\"{a}\r\n"));
+                        }
+                        o + "OK\r\n"
+                    }
+                    "GETSCRIPT" => {
+                        let n = quoted(&line, 0);
+                        let c = &scripts.iter().find(|(x, _)| *x == n).unwrap().1;
+                        format!("{{{}}}\r\n{c}\r\nOK\r\n", c.len())
+                    }
+                    "PUTSCRIPT" => {
+                        let n = quoted(&line, 0);
+                        scripts.retain(|(x, _)| *x != n);
+                        scripts.push((n, lit));
+                        "OK\r\n".into()
+                    }
+                    "SETACTIVE" => {
+                        active = Some(quoted(&line, 0)).filter(|n| !n.is_empty());
+                        "OK\r\n".into()
+                    }
+                    "DELETESCRIPT" => {
+                        let n = quoted(&line, 0);
+                        if active.as_deref() == Some(n.as_str()) {
+                            "NO (ACTIVE) \"active\"\r\n".into()
+                        } else {
+                            scripts.retain(|(x, _)| *x != n);
+                            "OK\r\n".into()
+                        }
+                    }
+                    "LOGOUT" => {
+                        let _ = w.write_all(b"OK\r\n");
+                        break;
+                    }
+                    _ => format!("NO \"unexpected {}\"\r\n", line.trim()),
+                };
+                w.write_all(reply.as_bytes()).unwrap();
+            }
+        });
+        port
+    }
+
+    /// First connect with two existing scripts → import → save the single
+    /// "vera-colander" script → it's active → delete the old scripts.
+    #[test]
+    fn one_script_migration_end_to_end() {
+        use crate::rules::{self, SCRIPT_NAME};
+        let legacy: rules::RuleSet = toml::from_str(
+            "[[rule]]\nname = \"Kernel\"\nif = [{ field = \"list-id\", op = \"contains\", value = \"kernel\" }]\nthen = [{ action = \"fileinto\", folder = \"Kernel\" }]\n",
+        )
+        .unwrap();
+        let foreign = "require [\"fileinto\", \"body\"];\r\nif body :contains \"recipe\" { fileinto \"Cooking\"; }\r\n";
+        let initial = vec![
+            ("NYT Cooking", foreign.to_string(), true),
+            ("Kernel Updates", rules::compile(&legacy).unwrap(), false),
+        ];
+        // SIEVE_E2E=host:port:user:pass runs this against a real server
+        // (plain TCP, e.g. a local Dovecot); otherwise an in-process fake.
+        let real = std::env::var("SIEVE_E2E").ok();
+        let (host, port, user, pass) = match &real {
+            Some(spec) => {
+                let v: Vec<&str> = spec.splitn(4, ':').collect();
+                (v[0].to_string(), v[1].parse().unwrap(), v[2].to_string(), v[3].to_string())
+            }
+            None => ("127.0.0.1".into(), stateful_server(initial.clone()), "u".into(), "p".into()),
+        };
+        let mut c = Client::connect(&ConnectOptions {
+            host,
+            port,
+            tls: TlsMode::None,
+            ca_file: None,
+            debug: false,
+        })
+        .unwrap();
+        c.authenticate_plain(&user, &pass).unwrap();
+        if real.is_some() {
+            // Start from the same state as the fake: just the two old scripts.
+            c.set_active("").unwrap();
+            for (n, _) in c.list_scripts().unwrap() {
+                c.delete_script(&n).unwrap();
+            }
+            for (n, content, active) in &initial {
+                c.put_script(n, content).unwrap();
+                if *active {
+                    c.set_active(n).unwrap();
+                }
+            }
+        }
+
+        // Import every script as groups (active one first, others disabled).
+        let mut listed = c.list_scripts().unwrap();
+        listed.sort_by_key(|(_, a)| !*a);
+        let mut set = rules::RuleSet::default();
+        for (name, active) in &listed {
+            let content = c.get_script(name).unwrap();
+            set.groups.extend(rules::import_script(name, &content, *active));
+        }
+        assert_eq!(set.groups.len(), 2);
+        assert!(set.groups[0].enabled && set.groups[0].rules[0].raw.is_some());
+        assert_eq!(set.groups[1].name, "Kernel Updates");
+        assert!(!set.groups[1].enabled, "inactive script imports disabled");
+        set.groups[1].enabled = true;
+
+        // Save: CHECKSCRIPT, PUTSCRIPT "vera-colander", SETACTIVE "vera-colander".
+        let script = rules::compile(&set).unwrap();
+        c.check_script(&script).unwrap();
+        c.put_script(SCRIPT_NAME, &script).unwrap();
+        c.set_active(SCRIPT_NAME).unwrap();
+        let listed = c.list_scripts().unwrap();
+        assert!(listed.contains(&(SCRIPT_NAME.to_string(), true)), "{listed:?}");
+
+        // What's on the server reopens as the same groups and script.
+        let stored = c.get_script(SCRIPT_NAME).unwrap().replace("\r\n", "\n");
+        let back = rules::extract(&stored).unwrap().unwrap();
+        assert_eq!(back.groups.len(), 2);
+        assert_eq!(rules::compile(&back).unwrap(), script);
+        let body = rules::without_embedded(&stored);
+        assert_eq!(body.matches("require").count(), 1, "{body}");
+        assert!(body.contains(r#"require ["body", "fileinto"];"#), "{body}");
+
+        // Offer accepted: delete the old scripts.
+        c.delete_script("NYT Cooking").unwrap();
+        c.delete_script("Kernel Updates").unwrap();
+        assert_eq!(c.list_scripts().unwrap(), vec![(SCRIPT_NAME.to_string(), true)]);
+        c.logout();
+    }
+
     #[test]
     fn full_session() {
         let port = fake_server(vec![

@@ -18,6 +18,8 @@ pub enum Req {
     Disconnect,
     List,
     Get(String),
+    /// Several scripts at once, for importing them as groups.
+    GetMany(Vec<String>),
     Check(String),
     Save {
         name: String,
@@ -26,7 +28,6 @@ pub enum Req {
     },
     Activate(String),
     Delete(String),
-    Rename(String, String),
     /// Mail folders over IMAP (implicit TLS on 993), for the folder picker.
     Folders,
     /// Work out what these rules would do to messages already in the Inbox.
@@ -55,6 +56,7 @@ pub enum Resp {
         name: String,
         content: String,
     },
+    LoadedMany(Vec<(String, String)>),
     Checked(Result<Option<String>, String>),
     Saved {
         name: String,
@@ -63,11 +65,6 @@ pub enum Resp {
     },
     Deleted {
         name: String,
-        scripts: Scripts,
-    },
-    Renamed {
-        old: String,
-        new: String,
         scripts: Scripts,
     },
     /// Separate from `Error`: a failed folder list shouldn't flag the session.
@@ -216,6 +213,14 @@ impl State {
                 let content = self.with(|c| c.get_script(&name))?;
                 Ok(Resp::Loaded { name, content })
             }
+            Req::GetMany(names) => {
+                let mut out = Vec::new();
+                for n in names {
+                    let content = self.with(|c| c.get_script(&n))?;
+                    out.push((n, content));
+                }
+                Ok(Resp::LoadedMany(out))
+            }
             Req::Check(script) => {
                 let r = self.with(|c| match c.check_script(&script) {
                     Ok(w) => Ok(Ok(w)),
@@ -264,13 +269,6 @@ impl State {
                     c.list_scripts()
                 })?;
                 Ok(Resp::Deleted { name, scripts })
-            }
-            Req::Rename(old, new) => {
-                let scripts = self.with(|c| {
-                    c.rename_script(&old, &new)?;
-                    c.list_scripts()
-                })?;
-                Ok(Resp::Renamed { old, new, scripts })
             }
             Req::Folders => {
                 let a = self.account()?;

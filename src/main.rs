@@ -110,7 +110,7 @@ enum Cmd {
     /// Compile a rules file, validate it on the server, and upload it
     Deploy {
         rules: Option<PathBuf>,
-        /// Script name on the server [default: profile `script` or "sievectl"]
+        /// Script name on the server [default: profile `script` or "vera-colander"]
         #[arg(short, long)]
         name: Option<String>,
         #[arg(short, long)]
@@ -124,12 +124,16 @@ enum Cmd {
     },
     /// Download a script made by sievectl and write its rules back to a TOML file
     Pull {
-        name: String,
+        /// Script name on the server [default: "vera-colander"]
+        name: Option<String>,
         #[arg(default_value = "rules.toml")]
         file: PathBuf,
         #[arg(short, long)]
         force: bool,
     },
+    /// Manage groups of rules in a rules file
+    #[command(subcommand)]
+    Group(GroupCmd),
     /// Manage rules in a rules file
     #[command(subcommand)]
     Rule(RuleCmd),
@@ -147,14 +151,65 @@ enum Cmd {
 }
 
 #[derive(Subcommand)]
+enum GroupCmd {
+    /// Add an empty group
+    Add {
+        name: String,
+        /// Insert at position (1 = first) instead of appending
+        #[arg(long)]
+        at: Option<usize>,
+        /// Create it disabled
+        #[arg(long)]
+        disabled: bool,
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+    /// List groups and their rules
+    #[command(alias = "ls")]
+    List {
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+    /// Remove a group and all its rules
+    #[command(alias = "rm")]
+    Remove {
+        name: String,
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+    /// Enable a group
+    Enable {
+        name: String,
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+    /// Disable a group (kept in the file, its rules omitted from the script)
+    Disable {
+        name: String,
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+    /// Move a group to a new position (1 = first)
+    Move {
+        name: String,
+        to: usize,
+        #[arg(short, long = "file")]
+        file: Option<PathBuf>,
+    },
+}
+
+#[derive(Subcommand)]
 enum RuleCmd {
     /// Add a rule.  Example:
-    ///   sievectl rule add -n GitHub --if "from.domain is github.com" --then "fileinto GitHub" --stop
+    ///   sievectl rule add -g Work -n GitHub --if "from.domain is github.com" --then "fileinto GitHub" --stop
     Add {
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
         #[arg(short, long)]
         name: String,
+        /// Group to add it to (created if missing) [default: "Rules"]
+        #[arg(short, long)]
+        group: Option<String>,
         /// Condition: "FIELD [not] OP [VALUE|VALUE...]" (repeatable)
         #[arg(long = "if", value_name = "COND")]
         conds: Vec<String>,
@@ -174,17 +229,23 @@ enum RuleCmd {
         #[arg(long)]
         at: Option<usize>,
     },
-    /// List rules
+    /// List rules (grouped)
     #[command(alias = "ls")]
     List {
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Only this group
+        #[arg(short, long)]
+        group: Option<String>,
     },
     /// Show the Sieve generated for one rule
     Show {
         name: String,
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Group holding the rule, if the name isn't unique
+        #[arg(short, long)]
+        group: Option<String>,
     },
     /// Remove a rule
     #[command(alias = "rm")]
@@ -192,25 +253,37 @@ enum RuleCmd {
         name: String,
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Group holding the rule, if the name isn't unique
+        #[arg(short, long)]
+        group: Option<String>,
     },
     /// Enable a rule
     Enable {
         name: String,
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Group holding the rule, if the name isn't unique
+        #[arg(short, long)]
+        group: Option<String>,
     },
     /// Disable a rule (kept in the file, omitted from the script)
     Disable {
         name: String,
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Group holding the rule, if the name isn't unique
+        #[arg(short, long)]
+        group: Option<String>,
     },
-    /// Move a rule to a new position (1 = first)
+    /// Move a rule to a new position within its group (1 = first)
     Move {
         name: String,
         to: usize,
         #[arg(short, long = "file")]
         file: Option<PathBuf>,
+        /// Group holding the rule, if the name isn't unique
+        #[arg(short, long)]
+        group: Option<String>,
     },
 }
 
@@ -411,7 +484,7 @@ fn run() -> Result<()> {
             let script = rules::compile(&rules::load(&path)?)?;
             let name = name
                 .or_else(|| ctx.profile.script.clone())
-                .unwrap_or_else(|| "sievectl".into());
+                .unwrap_or_else(|| rules::SCRIPT_NAME.into());
             let mut c = ctx.connect()?;
             let have = c.caps.sieve_extensions();
             if !have.is_empty() {
@@ -445,9 +518,11 @@ fn run() -> Result<()> {
                 eprintln!("{name} is unchanged on the server");
             } else {
                 print_warnings(c.put_script(&name, &script)?);
+                let set = rules::load(&path)?;
                 eprintln!(
-                    "uploaded {name} ({} rules)",
-                    rules::load(&path)?.rules.len()
+                    "uploaded {name} ({} groups, {} rules)",
+                    set.groups.len(),
+                    set.all_rules().count()
                 );
             }
             if activate && !current.is_some_and(|(_, a)| *a) {
@@ -459,18 +534,33 @@ fn run() -> Result<()> {
             c.logout();
         }
         Cmd::Pull { name, file, force } => {
+            // `pull rules.toml` means the file, not a script called that.
+            let (name, file) = match name {
+                Some(n) if n.ends_with(".toml") && file == Path::new("rules.toml") => {
+                    (rules::SCRIPT_NAME.to_string(), PathBuf::from(n))
+                }
+                n => (n.unwrap_or_else(|| rules::SCRIPT_NAME.into()), file),
+            };
             if file.exists() && !force {
                 bail!("{} exists (use --force to overwrite)", file.display());
             }
             let mut c = ctx.connect()?;
             let script = c.get_script(&name)?;
             c.logout();
-            let set = rules::extract(&script).with_context(|| {
-                format!("{name} was not generated by sievectl (no embedded rules)")
-            })??;
+            let set = rules::extract(&script)
+                .with_context(|| {
+                    format!("{name} was not generated by sievectl (no embedded rules)")
+                })??
+                .grouped(&name);
             rules::save(&file, &set)?;
-            eprintln!("wrote {} rules to {}", set.rules.len(), file.display());
+            eprintln!(
+                "wrote {} groups, {} rules to {}",
+                set.groups.len(),
+                set.all_rules().count(),
+                file.display()
+            );
         }
+        Cmd::Group(gc) => group_cmd(&ctx, gc)?,
         Cmd::Rule(rc) => rule_cmd(&ctx, rc)?,
         Cmd::Login { forget } => {
             let host = ctx
@@ -519,11 +609,99 @@ fn run() -> Result<()> {
     Ok(())
 }
 
-fn find(set: &rules::RuleSet, name: &str) -> Result<usize> {
-    set.rules
+fn find_group(set: &rules::RuleSet, name: &str) -> Result<usize> {
+    set.group_index(name)
+        .with_context(|| format!("no group named {name:?}"))
+}
+
+/// (group index, rule index) of a rule, optionally within one group.
+fn find(set: &rules::RuleSet, name: &str, group: Option<&str>) -> Result<(usize, usize)> {
+    let only = group.map(|g| find_group(set, g)).transpose()?;
+    let hits: Vec<(usize, usize)> = set
+        .groups
         .iter()
-        .position(|r| r.name.eq_ignore_ascii_case(name))
-        .with_context(|| format!("no rule named {name:?}"))
+        .enumerate()
+        .filter(|(gi, _)| only.is_none_or(|o| o == *gi))
+        .flat_map(|(gi, g)| {
+            g.rules
+                .iter()
+                .enumerate()
+                .filter(|(_, r)| r.name.eq_ignore_ascii_case(name))
+                .map(move |(ri, _)| (gi, ri))
+        })
+        .collect();
+    match hits.as_slice() {
+        [one] => Ok(*one),
+        [] => bail!("no rule named {name:?}"),
+        _ => bail!("several groups have a rule named {name:?}; pick one with --group"),
+    }
+}
+
+fn group_cmd(ctx: &Ctx, gc: GroupCmd) -> Result<()> {
+    match gc {
+        GroupCmd::Add {
+            name,
+            at,
+            disabled,
+            file,
+        } => {
+            let path = ctx.rules_path(file);
+            let mut set = rules::load_or_empty(&path)?.grouped(rules::DEFAULT_GROUP);
+            if set.group_index(&name).is_some() {
+                bail!("a group named {name:?} already exists");
+            }
+            let mut g = rules::Group::new(name.clone());
+            g.enabled = !disabled;
+            let pos = at
+                .map(|n| n.clamp(1, set.groups.len() + 1) - 1)
+                .unwrap_or(set.groups.len());
+            set.groups.insert(pos, g);
+            rules::save(&path, &set)?;
+            eprintln!("added group {name:?} as #{} in {}", pos + 1, path.display());
+        }
+        GroupCmd::List { file } => {
+            let set = rules::load(&ctx.rules_path(file))?;
+            for (i, g) in set.groups.iter().enumerate() {
+                println!(
+                    "{:>3}. {}  ({} rule{}){}",
+                    i + 1,
+                    g.name,
+                    g.rules.len(),
+                    if g.rules.len() == 1 { "" } else { "s" },
+                    if g.enabled { "" } else { "  [disabled]" }
+                );
+            }
+        }
+        GroupCmd::Remove { name, file } => {
+            let path = ctx.rules_path(file);
+            let mut set = rules::load(&path)?;
+            let g = set.groups.remove(find_group(&set, &name)?);
+            rules::save(&path, &set)?;
+            eprintln!("removed group {name:?} and its {} rules", g.rules.len());
+        }
+        GroupCmd::Enable { name, file } => set_group_enabled(ctx, file, &name, true)?,
+        GroupCmd::Disable { name, file } => set_group_enabled(ctx, file, &name, false)?,
+        GroupCmd::Move { name, to, file } => {
+            let path = ctx.rules_path(file);
+            let mut set = rules::load(&path)?;
+            let g = set.groups.remove(find_group(&set, &name)?);
+            let pos = to.clamp(1, set.groups.len() + 1) - 1;
+            set.groups.insert(pos, g);
+            rules::save(&path, &set)?;
+            eprintln!("moved group {name:?} to #{}", pos + 1);
+        }
+    }
+    Ok(())
+}
+
+fn set_group_enabled(ctx: &Ctx, file: Option<PathBuf>, name: &str, on: bool) -> Result<()> {
+    let path = ctx.rules_path(file);
+    let mut set = rules::load(&path)?;
+    let i = find_group(&set, name)?;
+    set.groups[i].enabled = on;
+    rules::save(&path, &set)?;
+    eprintln!("{} group {name:?}", if on { "enabled" } else { "disabled" });
+    Ok(())
 }
 
 fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
@@ -531,6 +709,7 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
         RuleCmd::Add {
             file,
             name,
+            group,
             conds,
             actions,
             any,
@@ -539,13 +718,27 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
             at,
         } => {
             let path = ctx.rules_path(file);
-            let mut set = rules::load_or_empty(&path)?;
-            if find(&set, &name).is_ok() {
-                bail!("a rule named {name:?} already exists");
+            let mut set = rules::load_or_empty(&path)?.grouped(rules::DEFAULT_GROUP);
+            let group = group.unwrap_or_else(|| rules::DEFAULT_GROUP.into());
+            let gi = match set.group_index(&group) {
+                Some(i) => i,
+                None => {
+                    set.groups.push(rules::Group::new(group.clone()));
+                    eprintln!("created group {group:?}");
+                    set.groups.len() - 1
+                }
+            };
+            if set.groups[gi]
+                .rules
+                .iter()
+                .any(|r| r.name.eq_ignore_ascii_case(&name))
+            {
+                bail!("group {group:?} already has a rule named {name:?}");
             }
             let mut rule = rules::Rule {
                 name,
                 enabled: true,
+                raw: None,
                 match_kind: if any {
                     rules::MatchKind::Any
                 } else {
@@ -565,47 +758,69 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
                 }
             }
             let snippet = rules::compile_rule(&rule, &mut Default::default())?;
+            let g = &mut set.groups[gi];
             let pos = at
-                .map(|n| n.clamp(1, set.rules.len() + 1) - 1)
-                .unwrap_or(set.rules.len());
-            set.rules.insert(pos, rule);
+                .map(|n| n.clamp(1, g.rules.len() + 1) - 1)
+                .unwrap_or(g.rules.len());
+            g.rules.insert(pos, rule);
+            let gname = g.name.clone();
             rules::save(&path, &set)?;
-            eprintln!("added as rule #{} in {}:", pos + 1, path.display());
+            eprintln!(
+                "added as rule #{} of group {gname:?} in {}:",
+                pos + 1,
+                path.display()
+            );
             print!("{snippet}");
         }
-        RuleCmd::List { file } => {
+        RuleCmd::List { file, group } => {
             let set = rules::load(&ctx.rules_path(file))?;
-            for (i, r) in set.rules.iter().enumerate() {
-                println!(
-                    "{:>3}. {}{}{}",
-                    i + 1,
-                    r.name,
-                    if r.enabled { "" } else { "  [disabled]" },
-                    if r.stop { "  (stop)" } else { "" }
-                );
+            let only = group.as_deref().map(|g| find_group(&set, g)).transpose()?;
+            for (gi, g) in set.groups.iter().enumerate() {
+                if only.is_some_and(|o| o != gi) {
+                    continue;
+                }
+                println!("{}{}", g.name, if g.enabled { "" } else { "  [disabled]" });
+                for (i, r) in g.rules.iter().enumerate() {
+                    println!(
+                        "  {:>3}. {}{}{}{}",
+                        i + 1,
+                        r.name,
+                        if r.raw.is_some() { "  (raw Sieve)" } else { "" },
+                        if r.enabled { "" } else { "  [disabled]" },
+                        if r.stop { "  (stop)" } else { "" }
+                    );
+                }
             }
         }
-        RuleCmd::Show { name, file } => {
+        RuleCmd::Show { name, file, group } => {
             let set = rules::load(&ctx.rules_path(file))?;
-            let r = &set.rules[find(&set, &name)?];
+            let (gi, ri) = find(&set, &name, group.as_deref())?;
+            let r = &set.groups[gi].rules[ri];
             print!("{}", rules::compile_rule(r, &mut Default::default())?);
         }
-        RuleCmd::Remove { name, file } => {
+        RuleCmd::Remove { name, file, group } => {
             let path = ctx.rules_path(file);
             let mut set = rules::load(&path)?;
-            let i = find(&set, &name)?;
-            set.rules.remove(i);
+            let (gi, ri) = find(&set, &name, group.as_deref())?;
+            set.groups[gi].rules.remove(ri);
             rules::save(&path, &set)?;
-            eprintln!("removed {name:?}");
+            eprintln!("removed {name:?} from group {:?}", set.groups[gi].name);
         }
-        RuleCmd::Enable { name, file } => set_enabled(ctx, file, &name, true)?,
-        RuleCmd::Disable { name, file } => set_enabled(ctx, file, &name, false)?,
-        RuleCmd::Move { name, to, file } => {
+        RuleCmd::Enable { name, file, group } => set_enabled(ctx, file, &name, group, true)?,
+        RuleCmd::Disable { name, file, group } => set_enabled(ctx, file, &name, group, false)?,
+        RuleCmd::Move {
+            name,
+            to,
+            file,
+            group,
+        } => {
             let path = ctx.rules_path(file);
             let mut set = rules::load(&path)?;
-            let r = set.rules.remove(find(&set, &name)?);
-            let pos = to.clamp(1, set.rules.len() + 1) - 1;
-            set.rules.insert(pos, r);
+            let (gi, ri) = find(&set, &name, group.as_deref())?;
+            let g = &mut set.groups[gi];
+            let r = g.rules.remove(ri);
+            let pos = to.clamp(1, g.rules.len() + 1) - 1;
+            g.rules.insert(pos, r);
             rules::save(&path, &set)?;
             eprintln!("moved {name:?} to #{}", pos + 1);
         }
@@ -613,11 +828,17 @@ fn rule_cmd(ctx: &Ctx, rc: RuleCmd) -> Result<()> {
     Ok(())
 }
 
-fn set_enabled(ctx: &Ctx, file: Option<PathBuf>, name: &str, on: bool) -> Result<()> {
+fn set_enabled(
+    ctx: &Ctx,
+    file: Option<PathBuf>,
+    name: &str,
+    group: Option<String>,
+    on: bool,
+) -> Result<()> {
     let path = ctx.rules_path(file);
     let mut set = rules::load(&path)?;
-    let i = find(&set, name)?;
-    set.rules[i].enabled = on;
+    let (gi, ri) = find(&set, name, group.as_deref())?;
+    set.groups[gi].rules[ri].enabled = on;
     rules::save(&path, &set)?;
     eprintln!("{} {name:?}", if on { "enabled" } else { "disabled" });
     Ok(())
