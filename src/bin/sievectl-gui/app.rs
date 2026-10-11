@@ -66,7 +66,7 @@ impl Doc {
 enum After {
     Open(String),
     NewScript,
-    Disconnect,
+    LogOut,
     Quit,
 }
 
@@ -96,6 +96,8 @@ pub struct App {
     worker: Worker,
     conn: Option<Conn>,
     connecting: bool,
+    /// Signing in on launch with the saved password: show a splash, not the form.
+    auto_connecting: bool,
     scripts: Scripts,
     doc: Option<Doc>,
     sel: Option<usize>,
@@ -129,12 +131,13 @@ impl App {
         } else {
             String::new()
         };
-        App {
+        let mut app = App {
             s,
             password,
             worker: Worker::spawn(cc.egui_ctx.clone()),
             conn: None,
             connecting: false,
+            auto_connecting: false,
             scripts: Vec::new(),
             doc: None,
             sel: None,
@@ -145,7 +148,16 @@ impl App {
             saving: None,
             folders: None,
             allow_close: false,
+        };
+        if app.s.remember
+            && !app.password.is_empty()
+            && !app.s.host.trim().is_empty()
+            && !app.s.user.trim().is_empty()
+        {
+            app.auto_connecting = true;
+            app.connect();
         }
+        app
     }
 
     fn info(&mut self, m: impl Into<String>) {
@@ -201,7 +213,12 @@ impl App {
                     raw: false,
                 })
             }
-            After::Disconnect => {
+            After::LogOut => {
+                // Forget the saved password so the next launch shows the login form.
+                if let Some(e) = keyring_entry(&self.s) {
+                    let _ = e.delete_credential();
+                }
+                self.password.clear();
                 self.doc = None;
                 self.worker.send(Req::Disconnect);
             }
@@ -248,6 +265,7 @@ impl App {
         match r {
             Resp::Connected { caps, scripts } => {
                 self.connecting = false;
+                self.auto_connecting = false;
                 if let Some(e) = keyring_entry(&self.s) {
                     let res = if self.s.remember {
                         e.set_password(&self.password)
@@ -275,7 +293,7 @@ impl App {
                 self.folders = None;
                 self.scripts.clear();
                 self.doc = None;
-                self.info("Disconnected");
+                self.info("Logged out");
             }
             Resp::Scripts { scripts, msg } => {
                 self.scripts = scripts;
@@ -372,6 +390,7 @@ impl App {
             Resp::Folders(r) => self.folders = Some(r),
             Resp::Error(e) => {
                 self.connecting = false;
+                self.auto_connecting = false;
                 self.saving = None;
                 self.error(e);
             }
@@ -381,6 +400,20 @@ impl App {
     // ---- views -------------------------------------------------------------
 
     fn connect_view(&mut self, ui: &mut egui::Ui) {
+        if self.auto_connecting {
+            ui.vertical_centered(|ui| {
+                ui.add_space(160.0);
+                ui.heading(RichText::new("Vera Colander").size(26.0));
+                ui.add_space(16.0);
+                ui.spinner();
+                ui.label(format!(
+                    "Signing in to {} as {}…",
+                    self.s.host.trim(),
+                    self.s.user.trim()
+                ));
+            });
+            return;
+        }
         ui.vertical_centered(|ui| {
             ui.add_space(60.0);
             ui.heading(RichText::new("Vera Colander").size(26.0));
@@ -494,8 +527,12 @@ impl App {
                 ui.label(RichText::new(&c.server).weak().small());
             }
         }
-        if ui.small_button("Disconnect").clicked() {
-            self.guard(After::Disconnect, ctx);
+        if ui
+            .small_button("Log out")
+            .on_hover_text("Disconnect and forget the saved password")
+            .clicked()
+        {
+            self.guard(After::LogOut, ctx);
         }
         ui.separator();
         ui.horizontal(|ui| {

@@ -17,7 +17,9 @@ cargo run --release --bin sievectl-gui
 
 1. Enter server, username, password (STARTTLS on 4190 by default). Tick
    *Remember password* to store it in the macOS Keychain, Windows Credential
-   Manager or the Linux Secret Service (GNOME Keyring/KWallet).
+   Manager or the Linux Secret Service (GNOME Keyring/KWallet). With a saved
+   password the app signs in on launch and goes straight to your rules;
+   *Log out* disconnects and forgets the saved password.
 2. Scripts on the server are listed on the left (★ = active). The active
    script opens automatically. Right-click for activate/rename/delete.
 3. Build rules: pick a field (From, From domain, Subject, List-Id, Size, any
