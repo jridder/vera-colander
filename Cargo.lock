@@ -3158,6 +3158,15 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "f8fadd59c855ef2080decdef8ff161eb6661b86933c9d82e5ba29dc602a55aba"
 
 [[package]]
+name = "sieve-rules"
+version = "0.3.0"
+dependencies = [
+ "anyhow",
+ "serde",
+ "toml",
+]
+
+[[package]]
 name = "sievectl"
 version = "0.3.0"
 dependencies = [
@@ -3174,6 +3183,7 @@ dependencies = [
  "rustls",
  "rustls-pki-types",
  "serde",
+ "sieve-rules",
  "tempfile",
  "toml",
  "webpki-roots",

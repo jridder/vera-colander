@@ -1,0 +1,11 @@
+[package]
+name = "sieve-rules"
+version = "0.3.0"
+edition = "2021"
+description = "Mail rules model and its Sieve compiler/importer, shared by Vera Colander and Rock Mail"
+license = "MIT"
+
+[dependencies]
+anyhow = "1"
+serde = { version = "1", features = ["derive"] }
+toml = "0.8"
