@@ -1,5 +1,7 @@
 //! Rule model (stored as TOML) and the compiler that turns it into Sieve (RFC 5228).
 
+pub mod eval;
+
 use anyhow::{anyhow, bail, Context, Result};
 use serde::{Deserialize, Serialize};
 use std::collections::BTreeSet;

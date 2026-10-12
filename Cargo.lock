@@ -3162,6 +3162,7 @@ name = "sieve-rules"
 version = "0.3.0"
 dependencies = [
  "anyhow",
+ "regex",
  "serde",
  "toml",
 ]
@@ -3178,7 +3179,6 @@ dependencies = [
  "egui",
  "keyring",
  "mail-parser",
- "regex",
  "rpassword",
  "rustls",
  "rustls-pki-types",
